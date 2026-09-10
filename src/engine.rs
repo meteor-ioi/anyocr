@@ -59,9 +59,12 @@ impl Engine {
         let (img_w, img_h) = (img.width(), img.height());
 
         // 1. 文本行定位检测 (PP-OCRv6 DBNet)
+        let t_det = Instant::now();
         let det_boxes = self.detector.detect(img)?;
+        let det_ms = t_det.elapsed().as_millis();
 
         // 2. 文本行切片裁剪与字符识别 (PP-OCRv6 SVTR)
+        let t_rec = Instant::now();
         let mut crops = Vec::with_capacity(det_boxes.len());
         for b in &det_boxes {
             let coords = b.to_array();
@@ -69,8 +72,11 @@ impl Engine {
             crops.push((crop, coords));
         }
         let boxes = self.recognizer.recognize_batch(&crops);
+        let rec_ms = t_rec.elapsed().as_millis();
 
         // 3. 表格结构预测 (若开启 table feature 且引擎配置启用)
+        #[cfg(feature = "table")]
+        let t_table = Instant::now();
         #[cfg(feature = "table")]
         let table_res = if self.config.enable_table {
             self.table_predictor.as_ref().and_then(|p| {
@@ -85,14 +91,18 @@ impl Engine {
         } else {
             None
         };
+        #[cfg(feature = "table")]
+        let table_ms = t_table.elapsed().as_millis();
 
         // 4. 端到端 AST 语义语法树与版面还原 (阅读顺序重排、标题定级、表格反填、段落合并)
+        let t_layout = Instant::now();
         let (blocks, markdown) = crate::layout::LayoutEngine::process(
             &boxes,
             (img_w, img_h),
             #[cfg(feature = "table")]
             table_res.as_ref(),
         );
+        let layout_ms = t_layout.elapsed().as_millis();
 
         let page = PageResult {
             page_index: 0,
@@ -102,6 +112,17 @@ impl Engine {
         };
 
         let elapsed_ms = t0.elapsed().as_millis() as u64;
+
+        #[cfg(feature = "table")]
+        eprintln!(
+            "[anyocr 阶段耗时] 分辨率: {}x{} | 检测: {}ms ({}行) | 识别: {}ms | 表格: {}ms | 排版: {}ms | 端到端: {}ms",
+            img_w, img_h, det_ms, det_boxes.len(), rec_ms, table_ms, layout_ms, elapsed_ms
+        );
+        #[cfg(not(feature = "table"))]
+        eprintln!(
+            "[anyocr 阶段耗时] 分辨率: {}x{} | 检测: {}ms ({}行) | 识别: {}ms | 排版: {}ms | 端到端: {}ms",
+            img_w, img_h, det_ms, det_boxes.len(), rec_ms, layout_ms, elapsed_ms
+        );
 
         Ok(ParsedDocument {
             markdown,

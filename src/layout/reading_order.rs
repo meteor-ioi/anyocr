@@ -56,17 +56,41 @@ impl ReadingOrder {
             return result;
         }
 
-        // 无分栏特征时，采用自上而下自左向右自然排序
-        let mut sorted = items.to_vec();
-        sorted.sort_by(|a, b| {
-            let y_diff = (a.coords[1] - b.coords[1]).abs();
-            // 在同一行高容差范围内 (8px) 优先按 X 轴排序
-            if y_diff < 8.0 {
-                a.coords[0].total_cmp(&b.coords[0])
-            } else {
-                a.coords[1].total_cmp(&b.coords[1])
+        // 无分栏特征时，先按 Y 轴自上而下聚类为文本行，再在每行内按 X 轴自左向右排序
+        let mut items_sorted_by_y = items.to_vec();
+        items_sorted_by_y.sort_by(|a, b| a.coords[1].total_cmp(&b.coords[1]));
+
+        let mut lines: Vec<Vec<TextBoxItem>> = Vec::new();
+
+        for item in items_sorted_by_y {
+            let item_y1 = item.coords[1];
+            let item_y2 = item.coords[3];
+            let item_h = (item_y2 - item_y1).max(1.0);
+
+            // 寻找是否可以加入最近的前一行（垂直重叠超过 40% 或行首间距在容差内）
+            let mut matched = false;
+            if let Some(last_line) = lines.last_mut() {
+                let line_y1 = last_line[0].coords[1];
+                let line_y2 = last_line[0].coords[3];
+                let line_h = (line_y2 - line_y1).max(1.0);
+
+                let overlap = (item_y2.min(line_y2) - item_y1.max(line_y1)).max(0.0);
+                if overlap > 0.4 * item_h.min(line_h) || (item_y1 - line_y1).abs() < 8.0 {
+                    last_line.push(item);
+                    matched = true;
+                }
             }
-        });
+
+            if !matched {
+                lines.push(vec![item]);
+            }
+        }
+
+        let mut sorted = Vec::with_capacity(items.len());
+        for mut line in lines {
+            line.sort_by(|a, b| a.coords[0].total_cmp(&b.coords[0]));
+            sorted.extend(line);
+        }
         sorted
     }
 
