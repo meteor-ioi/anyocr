@@ -1,0 +1,55 @@
+[package]
+name = "anyocr"
+version = "0.1.0"
+edition = "2024"
+authors = ["SensiDoc & anyocr Team"]
+description = "A native, Python-free Rust OCR & document layout engine powered by ONNX Runtime."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/icychick/anyocr"
+homepage = "https://github.com/icychick/anyocr"
+keywords = ["ocr", "markdown", "pdf", "ofd", "onnx"]
+categories = ["text-processing", "computer-vision", "parser-implementations"]
+
+[features]
+default = ["pdf", "ofd", "table", "download"]
+
+# 版式文档支持
+pdf = ["dep:lopdf"]
+ofd = ["dep:quick-xml", "dep:zip"]
+
+# 表格结构分析模型 (SLANet)
+table = []
+
+# 模型自动拉取与缓存 (离线封闭网络可关闭)
+download = ["dep:reqwest"]
+
+[dependencies]
+# 核心 ONNX Runtime 跨平台推理引擎 (无 Python 依赖)
+ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs"] }
+ndarray = "0.17"
+
+# 图像处理与计算机视觉基础
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "tiff"] }
+imageproc = "0.25"
+
+# 序列化与结构化输出
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 版式文档解析 (可选 PDF & OFD)
+lopdf = { version = "0.38", default-features = false, optional = true }
+quick-xml = { version = "0.41", optional = true }
+zip = { version = "8.6", default-features = false, features = ["deflate"], optional = true }
+
+# 文本编码与正则
+encoding_rs = "0.8"
+regex = "1.11"
+
+# 基础工具与网络下载 (用于按需拉取轻量 ONNX 权重)
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+thiserror = "2.0"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["full"] }

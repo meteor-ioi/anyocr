@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build_and_test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (Default Features)
+        run: cargo check --verbose
+
+      - name: Check (Minimal Features --no-default-features)
+        run: cargo check --no-default-features --verbose
+
+      - name: Run Unit & Integration Tests
+        run: cargo test --verbose
+
+      - name: Run Tests (No Default Features)
+        run: cargo test --no-default-features --verbose
