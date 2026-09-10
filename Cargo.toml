@@ -26,8 +26,8 @@ download = ["dep:reqwest"]
 
 [dependencies]
 # 核心 ONNX Runtime 跨平台推理引擎 (无 Python 依赖)
-ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs"] }
 ndarray = "0.17"
+rayon = "1.10"
 
 # 图像处理与计算机视觉基础
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "tiff"] }
@@ -53,3 +53,12 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["full"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs", "coreml"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs", "directml"] }
+
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs"] }

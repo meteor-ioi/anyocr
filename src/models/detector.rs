@@ -43,8 +43,16 @@ pub struct TextDetector {
 }
 
 impl TextDetector {
-    /// 从 ONNX 模型文件构建检测器
+    /// 从 ONNX 模型文件构建检测器 (默认 Auto 硬件探测加速)
     pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self, AnyOcrError> {
+        Self::from_file_with_provider(model_path, crate::types::ExecutionProvider::Auto)
+    }
+
+    /// 从 ONNX 模型文件与指定硬件执行提供者构建检测器
+    pub fn from_file_with_provider(
+        model_path: impl AsRef<Path>,
+        provider: crate::types::ExecutionProvider,
+    ) -> Result<Self, AnyOcrError> {
         let path_ref = model_path.as_ref();
         if !path_ref.exists() {
             return Err(AnyOcrError::ModelNotReady(format!(
@@ -53,12 +61,7 @@ impl TextDetector {
             )));
         }
 
-        let session = Session::builder()
-            .map_err(|e| AnyOcrError::InferenceError(format!("创建 ONNX SessionBuilder 失败: {e}")))?
-            .with_intra_threads(2)
-            .map_err(|e| AnyOcrError::InferenceError(format!("配置推理线程失败: {e}")))?
-            .commit_from_file(path_ref)
-            .map_err(|e| AnyOcrError::InferenceError(format!("加载检测模型失败: {e}")))?;
+        let session = crate::models::session::build_session(path_ref, provider)?;
 
         Ok(Self {
             session: Mutex::new(session),

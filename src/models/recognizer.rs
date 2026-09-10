@@ -10,13 +10,29 @@ use std::sync::Mutex;
 pub struct TextRecognizer {
     session: Mutex<Session>,
     character_dict: Vec<String>,
+    max_batch_size: usize,
 }
 
 impl TextRecognizer {
-    /// 从 ONNX 模型和字符字典文件构造识别器
+    /// 从 ONNX 模型和字符字典文件构造识别器 (默认 Auto 硬件加速，Batch=16)
     pub fn from_files(
         model_path: impl AsRef<Path>,
         dict_path: impl AsRef<Path>,
+    ) -> Result<Self, AnyOcrError> {
+        Self::from_files_with_provider(
+            model_path,
+            dict_path,
+            crate::types::ExecutionProvider::Auto,
+            16,
+        )
+    }
+
+    /// 从 ONNX 模型、字典文件、指定硬件执行提供者与最大批大小构造识别器
+    pub fn from_files_with_provider(
+        model_path: impl AsRef<Path>,
+        dict_path: impl AsRef<Path>,
+        provider: crate::types::ExecutionProvider,
+        max_batch_size: usize,
     ) -> Result<Self, AnyOcrError> {
         let model_ref = model_path.as_ref();
         let dict_ref = dict_path.as_ref();
@@ -47,16 +63,12 @@ impl TextRecognizer {
         // 末尾追加空格字符，与 Paddle 规范保持一致
         character_dict.push(" ".to_string());
 
-        let session = Session::builder()
-            .map_err(|e| AnyOcrError::InferenceError(format!("创建 ONNX SessionBuilder 失败: {e}")))?
-            .with_intra_threads(2)
-            .map_err(|e| AnyOcrError::InferenceError(format!("配置推理线程失败: {e}")))?
-            .commit_from_file(model_ref)
-            .map_err(|e| AnyOcrError::InferenceError(format!("加载识别模型失败: {e}")))?;
+        let session = crate::models::session::build_session(model_ref, provider)?;
 
         Ok(Self {
             session: Mutex::new(session),
             character_dict,
+            max_batch_size: if max_batch_size == 0 { 16 } else { max_batch_size },
         })
     }
 
@@ -182,7 +194,7 @@ impl TextRecognizer {
         }
 
         let mut all_results: Vec<(usize, TextBoxItem)> = Vec::with_capacity(crops.len());
-        let batch_size = 8;
+        let batch_size = self.max_batch_size.clamp(8, 32);
 
         // 2. 分桶批量前向推理
         for bucket in &buckets {
@@ -221,23 +233,39 @@ impl TextRecognizer {
         }
 
         // 寻找当前 batch 内的最大宽度作为齐平宽度
-        let max_w = chunk.iter().map(|item| item.3).max().unwrap_or(16).max(16);
-        let mut tensor = ndarray::Array4::<f32>::from_elem((b, 3, 48, max_w as usize), -1.0);
+        let max_w = chunk.iter().map(|item| item.3).max().unwrap_or(16).max(16) as usize;
 
-        for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
-            let resized = crop.resize_exact(*target_w, 48, image::imageops::FilterType::Triangle);
-            let rgb = resized.to_rgb8();
+        // 使用 rayon 并发对切片执行插值缩放与归一化
+        use rayon::prelude::*;
+        let slice_buffers: Vec<Vec<f32>> = chunk
+            .par_iter()
+            .map(|(_, crop, _, target_w)| {
+                let tw = *target_w as usize;
+                let resized = crop.resize_exact(*target_w, 48, image::imageops::FilterType::Triangle);
+                let rgb = resized.to_rgb8();
 
-            for y in 0..48 {
-                for x in 0..*target_w {
-                    let pixel = rgb.get_pixel(x, y);
-                    for c in 0..3 {
-                        let val = pixel[c] as f32 / 255.0;
-                        tensor[[i, c, y as usize, x as usize]] = (val - 0.5) / 0.5;
+                let mut slice = vec![-1.0f32; 3 * 48 * max_w];
+                for y in 0..48 {
+                    for x in 0..tw {
+                        let pixel = rgb.get_pixel(x as u32, y as u32);
+                        for c in 0..3 {
+                            let val = pixel[c] as f32 / 255.0;
+                            let idx = c * (48 * max_w) + y * max_w + x;
+                            slice[idx] = (val - 0.5) / 0.5;
+                        }
                     }
                 }
-            }
+                slice
+            })
+            .collect();
+
+        let mut flat_data = Vec::with_capacity(b * 3 * 48 * max_w);
+        for slice in slice_buffers {
+            flat_data.extend(slice);
         }
+
+        let tensor = ndarray::Array4::<f32>::from_shape_vec((b, 3, 48, max_w), flat_data)
+            .map_err(|e| AnyOcrError::InferenceError(format!("构建分桶批处理 Tensor 失败: {e}")))?;
 
         let cow_array = tensor.into_dyn();
         let input_value = ort::value::Value::from_array(cow_array)

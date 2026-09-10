@@ -27,16 +27,21 @@ impl Engine {
         let paths = ModelPaths::resolve(&config.profile)?;
 
         tracing::info!("正在加载 OCR 文本检测模型: {}", paths.det_path.display());
-        let detector = Arc::new(TextDetector::from_file(&paths.det_path)?);
+        let detector = Arc::new(TextDetector::from_file_with_provider(&paths.det_path, config.provider)?);
 
         tracing::info!("正在加载 OCR 文本识别模型: {}", paths.rec_path.display());
-        let recognizer = Arc::new(TextRecognizer::from_files(&paths.rec_path, &paths.dict_path)?);
+        let recognizer = Arc::new(TextRecognizer::from_files_with_provider(
+            &paths.rec_path,
+            &paths.dict_path,
+            config.provider,
+            config.max_batch_size,
+        )?);
 
         #[cfg(feature = "table")]
         let table_predictor = if config.enable_table {
             if let Some(ref t_path) = paths.table_path {
                 tracing::info!("正在加载表格结构预测模型: {}", t_path.display());
-                Some(Arc::new(TableStructurePredictor::from_file(t_path)?))
+                Some(Arc::new(TableStructurePredictor::from_file_with_provider(t_path, config.provider)?))
             } else {
                 None
             }
@@ -65,12 +70,15 @@ impl Engine {
 
         // 2. 文本行切片裁剪与字符识别 (PP-OCRv6 SVTR)
         let t_rec = Instant::now();
-        let mut crops = Vec::with_capacity(det_boxes.len());
-        for b in &det_boxes {
-            let coords = b.to_array();
-            let crop = ImagePreprocessor::crop_box(img, &coords);
-            crops.push((crop, coords));
-        }
+        use rayon::prelude::*;
+        let crops: Vec<(DynamicImage, [f32; 4])> = det_boxes
+            .par_iter()
+            .map(|b| {
+                let coords = b.to_array();
+                let crop = ImagePreprocessor::crop_box(img, &coords);
+                (crop, coords)
+            })
+            .collect();
         let boxes = self.recognizer.recognize_batch(&crops);
         let rec_ms = t_rec.elapsed().as_millis();
 

@@ -37,13 +37,15 @@ pub enum ModelProfile {
 /// 硬件加速提供者
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutionProvider {
-    /// 智能探测 (Mac 优先 CoreML，Linux 优先 CUDA，回退 CPU)
+    /// 智能探测 (Mac 优先 CoreML，Windows 优先 DirectML，Linux 优先 CUDA，回退 CPU)
     #[default]
     Auto,
     /// 纯 CPU SIMD 推理
     Cpu,
     /// Apple Silicon CoreML 神经计算加速
     CoreML,
+    /// Windows DirectML GPU 加速 (带 GPU 设备编号)
+    DirectML(i32),
     /// Nvidia CUDA GPU 加速 (带 GPU 设备编号)
     Cuda(i32),
 }
