@@ -3,5 +3,5 @@
 Cargo.lock
 .DS_Store
 *.onnx
-models/
-bin/
+/models/
+/bin/
