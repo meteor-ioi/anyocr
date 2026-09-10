@@ -34,68 +34,24 @@ fn apply_execution_provider(
     provider: ExecutionProvider,
 ) -> Result<SessionBuilder, AnyOcrError> {
     match provider {
-        ExecutionProvider::Cpu => {
-            tracing::info!("使用纯 CPU SIMD 推理模式");
+        ExecutionProvider::Cpu | ExecutionProvider::CoreML => {
+            // CoreML 禁用：避免动态尺寸编译导致的内存与 Swap 暴涨，直接采用纯 CPU SIMD
+            tracing::info!("使用高性能多核 CPU SIMD 推理模式");
             Ok(builder)
         }
         ExecutionProvider::Auto => {
-            #[cfg(target_os = "macos")]
-            {
-                tracing::info!("Auto 模式：探测到 macOS 平台，尝试启用 Apple CoreML / Neural Engine 硬件加速");
-                let coreml_ep = ort::ep::CoreML::default().build();
-                match builder.with_execution_providers([coreml_ep]) {
-                    Ok(b) => return Ok(b),
-                    Err(e) => {
-                        tracing::warn!("启用 CoreML 失败，平滑回退到多核 CPU 推理: {e}");
-                        let num_threads = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4)
-                            .clamp(2, 16);
-                        return Session::builder()
-                            .map_err(|err| AnyOcrError::InferenceError(format!("创建回退 SessionBuilder 失败: {err}")))?
-                            .with_intra_threads(num_threads)
-                            .map_err(|err| AnyOcrError::InferenceError(format!("配置回退线程失败: {err}")));
-                    }
-                }
-            }
-
             #[cfg(target_os = "windows")]
             {
                 tracing::info!("Auto 模式：探测到 Windows 平台，尝试启用 DirectML GPU 硬件加速");
                 let directml_ep = ort::ep::DirectML::default().build();
-                match builder.with_execution_providers([directml_ep]) {
-                    Ok(b) => return Ok(b),
-                    Err(e) => {
-                        tracing::warn!("启用 DirectML 失败，平滑回退到多核 CPU 推理: {e}");
-                        let num_threads = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4)
-                            .clamp(2, 16);
-                        return Session::builder()
-                            .map_err(|err| AnyOcrError::InferenceError(format!("创建回退 SessionBuilder 失败: {err}")))?
-                            .with_intra_threads(num_threads)
-                            .map_err(|err| AnyOcrError::InferenceError(format!("配置回退线程失败: {err}")));
-                    }
+                if let Ok(b) = builder.with_execution_providers([directml_ep]) {
+                    return Ok(b);
                 }
+                tracing::warn!("启用 DirectML 失败，平滑回退到多核 CPU 推理");
             }
 
-            #[allow(unreachable_code)]
-            {
-                tracing::info!("Auto 模式：使用高并发多核 CPU 推理");
-                Ok(builder)
-            }
-        }
-        ExecutionProvider::CoreML => {
-            #[cfg(target_os = "macos")]
-            {
-                let coreml_ep = ort::ep::CoreML::default().build();
-                builder.with_execution_providers([coreml_ep])
-                    .map_err(|e| AnyOcrError::InferenceError(format!("配置 CoreML 执行提供者失败: {e}")))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Err(AnyOcrError::InferenceError("当前平台非 macOS，不支持 CoreML".to_string()))
-            }
+            tracing::info!("Auto 模式：使用高并发多核 CPU SIMD 推理 (零动态图重编译开销)");
+            Ok(builder)
         }
         ExecutionProvider::DirectML(_device_id) => {
             #[cfg(target_os = "windows")]
