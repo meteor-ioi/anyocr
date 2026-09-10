@@ -68,20 +68,21 @@ impl ReadingOrder {
             let item_h = (item_y2 - item_y1).max(1.0);
 
             // 寻找是否可以加入最近的前一行（垂直重叠超过 40% 或行首间距在容差内）
-            let mut matched = false;
-            if let Some(last_line) = lines.last_mut() {
+            let mut can_merge = false;
+            if let Some(last_line) = lines.last() {
                 let line_y1 = last_line[0].coords[1];
                 let line_y2 = last_line[0].coords[3];
                 let line_h = (line_y2 - line_y1).max(1.0);
 
                 let overlap = (item_y2.min(line_y2) - item_y1.max(line_y1)).max(0.0);
                 if overlap > 0.4 * item_h.min(line_h) || (item_y1 - line_y1).abs() < 8.0 {
-                    last_line.push(item);
-                    matched = true;
+                    can_merge = true;
                 }
             }
 
-            if !matched {
+            if can_merge {
+                lines.last_mut().unwrap().push(item);
+            } else {
                 lines.push(vec![item]);
             }
         }
