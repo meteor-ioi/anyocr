@@ -24,10 +24,16 @@ table = []
 # 模型自动拉取与缓存 (离线封闭网络可关闭)
 download = ["dep:reqwest"]
 
+# 硬件加速提供者 (按目标硬件选择开启)
+coreml = ["ort/coreml"]
+directml = ["ort/directml"]
+cuda = ["ort/cuda"]
+
+
 [dependencies]
 # 核心 ONNX Runtime 跨平台推理引擎 (无 Python 依赖)
+ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs"] }
 ndarray = "0.17"
-rayon = "1.10"
 
 # 图像处理与计算机视觉基础
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp", "tiff"] }
@@ -53,9 +59,3 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1.43", features = ["full"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs", "directml"] }
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-ort = { version = "2.0.0-rc.9", features = ["download-binaries", "copy-dylibs"] }

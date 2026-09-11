@@ -72,8 +72,12 @@ impl ModelPaths {
                 for dir in &search_dirs {
                     let det = dir.join(DET_SMALL_FILENAME);
                     let mut rec = dir.join(rec_filename);
-                    if !rec.exists() && profile == &ModelProfile::Standard {
-                        rec = dir.join(REC_MEDIUM_FILENAME);
+                    if !rec.exists() {
+                        if profile == &ModelProfile::Fast && dir.join(REC_MEDIUM_FILENAME).exists() {
+                            rec = dir.join(REC_MEDIUM_FILENAME);
+                        } else if profile == &ModelProfile::Standard && dir.join(REC_MOBILE_FILENAME).exists() {
+                            rec = dir.join(REC_MOBILE_FILENAME);
+                        }
                     }
                     let dict = dir.join(DICT_FILENAME);
                     let table = dir.join(TABLE_FILENAME);

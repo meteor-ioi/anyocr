@@ -77,4 +77,36 @@ impl DocBlock {
             }
         }
     }
+
+    /// 对 AST 节点的空间坐标做缩放变换 (用于分辨率缩放还原物理坐标)
+    pub fn rescale(&mut self, factor: f32) {
+        if factor == 1.0 || factor <= 0.0 {
+            return;
+        }
+        let scale_coords = |c: &mut [f32; 4]| {
+            c[0] /= factor;
+            c[1] /= factor;
+            c[2] /= factor;
+            c[3] /= factor;
+        };
+
+        match self {
+            DocBlock::Heading { bbox, .. } => scale_coords(bbox),
+            DocBlock::Paragraph { lines, bbox } => {
+                scale_coords(bbox);
+                for line in lines {
+                    scale_coords(&mut line.coords);
+                }
+            }
+            DocBlock::Table { bbox, .. } => scale_coords(bbox),
+            DocBlock::List { items, bbox, .. } => {
+                scale_coords(bbox);
+                for item in items {
+                    scale_coords(&mut item.bbox);
+                }
+            }
+            DocBlock::Image { bbox, .. } => scale_coords(bbox),
+        }
+    }
 }
+

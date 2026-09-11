@@ -91,25 +91,13 @@ pub struct TableStructurePredictor {
 }
 
 impl TableStructurePredictor {
-    /// 从 ONNX 模型文件构建预测器 (默认 Auto 硬件探测加速)
-    pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self, AnyOcrError> {
-        Self::from_file_with_provider(model_path, crate::types::ExecutionProvider::Auto)
-    }
-
-    /// 从 ONNX 模型文件与指定硬件执行提供者构建预测器
-    pub fn from_file_with_provider(
+    /// 从 ONNX 模型文件构建预测器并初始化内置标准词表 (支持硬件加速模式)
+    pub fn from_file(
         model_path: impl AsRef<Path>,
         provider: crate::types::ExecutionProvider,
     ) -> Result<Self, AnyOcrError> {
-        let path_ref = model_path.as_ref();
-        if !path_ref.exists() {
-            return Err(AnyOcrError::ModelNotReady(format!(
-                "表格模型文件不存在: {}",
-                path_ref.display()
-            )));
-        }
+        let session = crate::models::session::build_session(model_path, provider)?;
 
-        let session = crate::models::session::build_session(path_ref, provider)?;
 
         // SLANet_plus 官方标准 50 词元结构词表
         let mut vocab = Vec::with_capacity(50);

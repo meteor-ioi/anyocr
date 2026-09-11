@@ -74,17 +74,20 @@ impl ImagePreprocessor {
         let mean = [0.485f32, 0.456f32, 0.406f32];
         let std = [0.229f32, 0.224f32, 0.225f32];
 
-        let mut tensor = Array4::<f32>::zeros((1, 3, target_h as usize, target_w as usize));
+        let area = (target_w * target_h) as usize;
+        let mut data = vec![0.0f32; 3 * area];
+        let (r_plane, gb_plane) = data.split_at_mut(area);
+        let (g_plane, b_plane) = gb_plane.split_at_mut(area);
 
-        for y in 0..target_h {
-            for x in 0..target_w {
-                let pixel = rgb_img.get_pixel(x, y);
-                for c in 0..3 {
-                    let val = pixel[c] as f32 / 255.0;
-                    tensor[[0, c, y as usize, x as usize]] = (val - mean[c]) / std[c];
-                }
-            }
+        let raw_bytes = rgb_img.as_raw();
+        for (i, chunk) in raw_bytes.chunks_exact(3).enumerate() {
+            r_plane[i] = (chunk[0] as f32 / 255.0 - mean[0]) / std[0];
+            g_plane[i] = (chunk[1] as f32 / 255.0 - mean[1]) / std[1];
+            b_plane[i] = (chunk[2] as f32 / 255.0 - mean[2]) / std[2];
         }
+
+        let tensor = Array4::from_shape_vec((1, 3, target_h as usize, target_w as usize), data)
+            .map_err(|e| AnyOcrError::Other(format!("构建检测输入 Tensor 失败: {e}")))?;
 
         Ok((tensor, resize_info))
     }
@@ -109,17 +112,20 @@ impl ImagePreprocessor {
         let resized = crop.resize_exact(target_w, target_height, image::imageops::FilterType::Triangle);
         let rgb_img = resized.to_rgb8();
 
-        let mut tensor = Array4::<f32>::zeros((1, 3, target_height as usize, target_w as usize));
+        let area = (target_w * target_height) as usize;
+        let mut data = vec![0.0f32; 3 * area];
+        let (r_plane, gb_plane) = data.split_at_mut(area);
+        let (g_plane, b_plane) = gb_plane.split_at_mut(area);
 
-        for y in 0..target_height {
-            for x in 0..target_w {
-                let pixel = rgb_img.get_pixel(x, y);
-                for c in 0..3 {
-                    let val = pixel[c] as f32 / 255.0;
-                    tensor[[0, c, y as usize, x as usize]] = (val - 0.5) / 0.5;
-                }
-            }
+        let raw_bytes = rgb_img.as_raw();
+        for (i, chunk) in raw_bytes.chunks_exact(3).enumerate() {
+            r_plane[i] = (chunk[0] as f32 / 255.0 - 0.5) / 0.5;
+            g_plane[i] = (chunk[1] as f32 / 255.0 - 0.5) / 0.5;
+            b_plane[i] = (chunk[2] as f32 / 255.0 - 0.5) / 0.5;
         }
+
+        let tensor = Array4::from_shape_vec((1, 3, target_height as usize, target_w as usize), data)
+            .map_err(|e| AnyOcrError::Other(format!("构建识别输入 Tensor 失败: {e}")))?;
 
         Ok(tensor)
     }
@@ -158,17 +164,26 @@ impl ImagePreprocessor {
         let mean = [0.485f32, 0.456f32, 0.406f32];
         let std = [0.229f32, 0.224f32, 0.225f32];
 
-        let mut tensor = Array4::<f32>::zeros((1, 3, 488, 488));
+        let area = 488 * 488;
+        let mut data = vec![0.0f32; 3 * area];
+        let (r_plane, gb_plane) = data.split_at_mut(area);
+        let (g_plane, b_plane) = gb_plane.split_at_mut(area);
 
-        for y in 0..resize_h {
-            for x in 0..resize_w {
-                let pixel = rgb_img.get_pixel(x, y);
-                for c in 0..3 {
-                    let val = pixel[c] as f32 / 255.0;
-                    tensor[[0, c, y as usize, x as usize]] = (val - mean[c]) / std[c];
-                }
+        let raw_bytes = rgb_img.as_raw();
+        let stride = resize_w as usize * 3;
+        for y in 0..resize_h as usize {
+            let row_offset = y * 488;
+            let src_row = &raw_bytes[y * stride..(y + 1) * stride];
+            for (x, chunk) in src_row.chunks_exact(3).enumerate() {
+                let idx = row_offset + x;
+                r_plane[idx] = (chunk[0] as f32 / 255.0 - mean[0]) / std[0];
+                g_plane[idx] = (chunk[1] as f32 / 255.0 - mean[1]) / std[1];
+                b_plane[idx] = (chunk[2] as f32 / 255.0 - mean[2]) / std[2];
             }
         }
+
+        let tensor = Array4::from_shape_vec((1, 3, 488, 488), data)
+            .map_err(|e| AnyOcrError::Other(format!("构建表格输入 Tensor 失败: {e}")))?;
 
         Ok((tensor, resize_info))
     }

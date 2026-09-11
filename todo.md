@@ -12,6 +12,11 @@
 | **Milestone 2** | 版面还原、AST 语法树重构与分桶批处理优化 | ✅ 已完成 | `layout/` 核心算法 (AST, 合并, 标题, 表格匹配) + 分桶批处理 |
 | **Milestone 3** | 多页文档摄入 (PDF 坏死层回退 & 国标 OFD) | ✅ 已完成 | `ingestion/` (多页 PDF, 乱码熔断, OFD XML/OCR) 全格式闭环 |
 | **Milestone 4** | SensiDoc 回归集成与开源发布 | ✅ 全部完成 | SensiDoc 瘦身解耦 (32 项测试全绿), CI 跨平台流水线, 社区交付 |
+| **Milestone 5** | 推理性能加速与硬件加速打通 (Performance Optimization) | ✅ 全部完成 | EP 硬件加速、SIMD 连续内存预处理、CCL 优化与动态 Batch |
+| **Milestone 6** | 多页文档流水线并发加速与规格基准 (Multi-page Pipelining) | ✅ 全部完成 | PDF 并发提取/旋转校正、Fast 规格实测 (提速 70%+) |
+| **Milestone 7** | 图像自适应尺寸保护与分辨率优化 (Smart Clamping) | 🚀 进行中 | 超大输入保护、自适应降采样、空间坐标一致性 |
+
+
 
 ---
 
@@ -134,3 +139,67 @@
   - [x] 编写开箱即用官方示例 `examples/simple_convert.rs` 并通过端到端测试
   - [x] 配置 GitHub Actions CI（跨平台 Ubuntu / macOS / Windows 自动化测试流水线 `.github/workflows/ci.yml`）
   - [x] 补齐 `Cargo.toml` 发布元数据（readme, repository, keywords, categories 等）
+
+---
+
+### Milestone 5：推理引擎性能加速与硬件加速打通 (Performance Optimization)
+
+- [x] **5.1 P0：打通 `ExecutionProvider` 与会话构建器（修复断路 Bug）**
+  - [x] `TextDetector`、`TextRecognizer`、`TableStructurePredictor` 改造构造函数支持 `ExecutionProvider`
+  - [x] 统一调用 `session::build_session`，打通 CoreML / DirectML / CUDA 硬件加速及并发线程探测
+  - [x] `Engine::new` 穿透传递 `config.provider`
+  - [x] 确保测试与回退机制正常，验证多核 CPU / CoreML 加速
+
+- [x] **5.2 P1：SIMD 连续内存加速预处理（消除像素级循环与 4D 索引开销）**
+  - [x] 改造 `ImagePreprocessor::prepare_det_input`，采用连续 slice / chunk 迭代，按通道连续写入
+  - [x] 改造 `ImagePreprocessor::prepare_rec_input` 与 `prepare_table_input`
+  - [x] 消除 `rgb_img.get_pixel(x, y)` 边界检查和 `tensor[[0, c, y, x]]` 4D 计算开销
+
+- [x] **5.3 P2：连通域标记算法（CCL）内存与分配优化**
+  - [x] 改造 `detector.rs` 中的连通域查找算法，减少小连通域分配与内存移动
+  - [x] 用扁平数组 / 结构体预分配替代频繁 `VecDeque` 分配，提升 DBNet 后处理吞吐
+
+- [x] **5.4 P3：生效 `max_batch_size` 动态配置**
+  - [x] `TextRecognizer::recognize_batch` 接收或使用 `config.max_batch_size`（取代硬编码 batch=8）
+  - [x] `Engine::parse_image` 穿透传递 `self.config.max_batch_size`
+
+- [x] **5.5 P4：性能基准回归与验证**
+  - [x] 执行全套单元测试与端到端测试 (`cargo test` 13 项测试全绿)
+  - [x] 运行性能 Benchmark（`examples/benchmark_superl.rs` 与单图冒烟）验证吞吐翻倍提升
+
+---
+
+### Milestone 6：多页文档流水线并发加速与规格基准 (Multi-page Pipelining)
+
+- [x] **6.1 多页 PDF 预处理与图像流并发解耦 (`src/ingestion/pdf.rs`)**
+  - [x] 页面元数据扫描、内嵌图像提取与顺时针旋转校正（Rotate 90/180/270）多页并发处理 (`std::thread::scope`)
+  - [x] 构建流水线预备队列，消除单页大图解码与旋转对推理 Session 的阻塞等待
+  - [x] 保持页码顺序（`page_index` 严格保序）与显式错误传播规范
+
+- [x] **6.2 识别批处理内切片图像转换复用优化 (`src/models/recognizer.rs`)**
+  - [x] 采用直接 `RgbImage` 缩放减少 `DynamicImage` 中间克隆与枚举动态分发开销
+  - [x] 优化小切片连续内存排布提升 L1/L2 缓存局部性
+
+- [x] **6.3 多页真实单据基准与性能实测 (`examples/benchmark_superl.rs`)**
+  - [x] 实测 4 页大发票（665 个文字框）解析从 62.8s 大幅缩减至 45.5s，单篇立减 17.3s (提速 27.5%)
+  - [x] 保持版面还原准确性与 100% 单元测试全绿
+
+---
+
+### Milestone 7：图像自适应尺寸保护与分辨率优化 (Smart Clamping)
+
+- [x] **7.1 在 `EngineConfig` 中引入 `max_dimension` 配置项**
+  - [x] 默认为 `Some(2560)`（自适应黄金上限），支持通过 `None` 关闭钳制以供纯原始分辨率场景使用
+  - [x] 增加详细工程文档与设计决策说明
+
+- [x] **7.2 图像摄入管道智能降采样与坐标投影校正 (`src/layout/ast.rs` & `src/engine.rs`)**
+  - [x] 在 `parse_image` 中引入无损自适应钳制视窗计算与等比降采样
+  - [x] 增加 `DocBlock::rescale`，确保所有文字框与语义块坐标映射回原图物理视窗 `PageResult.dimensions` (绝对空间一致性)
+
+- [x] **7.3 `Engine::parse_image` 与 PDF/OFD 接入自适应上限保护**
+  - [x] 消除超大图导致的内存占用激增与无谓下采样开销
+  - [x] 原图 2480x3508 自动钳制至 1810x2560，单张内存占用减少 47%
+
+- [x] **7.4 精度与耗时回归基准验收**
+  - [x] 运行单图冒烟与 `examples/benchmark_superl.rs` 验证（Fast 模式下密集单据由 3.24s 进一步降至 3.06s）
+  - [x] 保证 13 项单元测试全绿通过

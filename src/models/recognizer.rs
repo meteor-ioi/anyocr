@@ -14,21 +14,8 @@ pub struct TextRecognizer {
 }
 
 impl TextRecognizer {
-    /// 从 ONNX 模型和字符字典文件构造识别器 (默认 Auto 硬件加速，Batch=16)
+    /// 从 ONNX 模型和字符字典文件构造识别器 (支持指定硬件加速提供者与最大批大小)
     pub fn from_files(
-        model_path: impl AsRef<Path>,
-        dict_path: impl AsRef<Path>,
-    ) -> Result<Self, AnyOcrError> {
-        Self::from_files_with_provider(
-            model_path,
-            dict_path,
-            crate::types::ExecutionProvider::Auto,
-            16,
-        )
-    }
-
-    /// 从 ONNX 模型、字典文件、指定硬件执行提供者与最大批大小构造识别器
-    pub fn from_files_with_provider(
         model_path: impl AsRef<Path>,
         dict_path: impl AsRef<Path>,
         provider: crate::types::ExecutionProvider,
@@ -68,9 +55,10 @@ impl TextRecognizer {
         Ok(Self {
             session: Mutex::new(session),
             character_dict,
-            max_batch_size: if max_batch_size == 0 { 16 } else { max_batch_size },
+            max_batch_size: max_batch_size.clamp(1, 64),
         })
     }
+
 
     /// 对单行裁剪切片执行文字识别与 CTC 贪心解码
     pub fn recognize_crop(&self, crop: &DynamicImage) -> Result<(String, f32), AnyOcrError> {
@@ -194,7 +182,7 @@ impl TextRecognizer {
         }
 
         let mut all_results: Vec<(usize, TextBoxItem)> = Vec::with_capacity(crops.len());
-        let batch_size = self.max_batch_size.clamp(8, 32);
+        let batch_size = self.max_batch_size;
 
         // 2. 分桶批量前向推理
         for bucket in &buckets {
@@ -234,38 +222,25 @@ impl TextRecognizer {
 
         // 寻找当前 batch 内的最大宽度作为齐平宽度
         let max_w = chunk.iter().map(|item| item.3).max().unwrap_or(16).max(16) as usize;
+        let mut tensor = ndarray::Array4::<f32>::from_elem((b, 3, 48, max_w), -1.0);
 
-        // 使用 rayon 并发对切片执行插值缩放与归一化
-        use rayon::prelude::*;
-        let slice_buffers: Vec<Vec<f32>> = chunk
-            .par_iter()
-            .map(|(_, crop, _, target_w)| {
-                let tw = *target_w as usize;
-                let resized = crop.resize_exact(*target_w, 48, image::imageops::FilterType::Triangle);
-                let rgb = resized.to_rgb8();
+        for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
+            let tw = *target_w as usize;
+            let rgb_crop = crop.to_rgb8();
+            let resized = image::imageops::resize(&rgb_crop, *target_w, 48, image::imageops::FilterType::Triangle);
+            let raw_bytes = resized.as_raw();
+            let stride = tw * 3;
 
-                let mut slice = vec![-1.0f32; 3 * 48 * max_w];
-                for y in 0..48 {
-                    for x in 0..tw {
-                        let pixel = rgb.get_pixel(x as u32, y as u32);
-                        for c in 0..3 {
-                            let val = pixel[c] as f32 / 255.0;
-                            let idx = c * (48 * max_w) + y * max_w + x;
-                            slice[idx] = (val - 0.5) / 0.5;
-                        }
-                    }
+            for y in 0..48 {
+                let src_row = &raw_bytes[y * stride..(y + 1) * stride];
+                for (x, p) in src_row.chunks_exact(3).enumerate() {
+                    tensor[[i, 0, y, x]] = p[0] as f32 / 127.5 - 1.0;
+                    tensor[[i, 1, y, x]] = p[1] as f32 / 127.5 - 1.0;
+                    tensor[[i, 2, y, x]] = p[2] as f32 / 127.5 - 1.0;
                 }
-                slice
-            })
-            .collect();
-
-        let mut flat_data = Vec::with_capacity(b * 3 * 48 * max_w);
-        for slice in slice_buffers {
-            flat_data.extend(slice);
+            }
         }
 
-        let tensor = ndarray::Array4::<f32>::from_shape_vec((b, 3, 48, max_w), flat_data)
-            .map_err(|e| AnyOcrError::InferenceError(format!("构建分桶批处理 Tensor 失败: {e}")))?;
 
         let cow_array = tensor.into_dyn();
         let input_value = ort::value::Value::from_array(cow_array)

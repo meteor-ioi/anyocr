@@ -11,3 +11,4 @@ pub use session::build_session;
 
 #[cfg(feature = "table")]
 pub use table::{CellBox, TableStructurePredictor, TableStructureResult};
+

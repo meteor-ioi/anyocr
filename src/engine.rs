@@ -27,10 +27,10 @@ impl Engine {
         let paths = ModelPaths::resolve(&config.profile)?;
 
         tracing::info!("正在加载 OCR 文本检测模型: {}", paths.det_path.display());
-        let detector = Arc::new(TextDetector::from_file_with_provider(&paths.det_path, config.provider)?);
+        let detector = Arc::new(TextDetector::from_file(&paths.det_path, config.provider)?);
 
         tracing::info!("正在加载 OCR 文本识别模型: {}", paths.rec_path.display());
-        let recognizer = Arc::new(TextRecognizer::from_files_with_provider(
+        let recognizer = Arc::new(TextRecognizer::from_files(
             &paths.rec_path,
             &paths.dict_path,
             config.provider,
@@ -41,7 +41,7 @@ impl Engine {
         let table_predictor = if config.enable_table {
             if let Some(ref t_path) = paths.table_path {
                 tracing::info!("正在加载表格结构预测模型: {}", t_path.display());
-                Some(Arc::new(TableStructurePredictor::from_file_with_provider(t_path, config.provider)?))
+                Some(Arc::new(TableStructurePredictor::from_file(t_path, config.provider)?))
             } else {
                 None
             }
@@ -58,28 +58,43 @@ impl Engine {
         })
     }
 
-    /// 对 DynamicImage 执行完整的文本检测、文字识别、表格预测与 AST 版面重构
+    /// 对 DynamicImage 执行完整的文本检测、文字识别、表格预测与 AST 版面重构 (支持超大图自适应钳制与原图坐标还原)
     pub fn parse_image(&self, img: &DynamicImage) -> Result<ParsedDocument, AnyOcrError> {
         let t0 = Instant::now();
-        let (img_w, img_h) = (img.width(), img.height());
+        let (orig_w, orig_h) = (img.width(), img.height());
+
+        // 0. 自适应最长边尺寸保护 (Smart Clamping: 限制超大图内存与计算浪费)
+        let (working_img, scale_factor) = if let Some(max_dim) = self.config.max_dimension {
+            let max_side = orig_w.max(orig_h);
+            if max_side > max_dim && max_side > 0 {
+                let factor = max_dim as f32 / max_side as f32;
+                let target_w = ((orig_w as f32 * factor).round() as u32).max(1);
+                let target_h = ((orig_h as f32 * factor).round() as u32).max(1);
+                let resized = img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+                (std::borrow::Cow::Owned(resized), factor)
+            } else {
+                (std::borrow::Cow::Borrowed(img), 1.0f32)
+            }
+        } else {
+            (std::borrow::Cow::Borrowed(img), 1.0f32)
+        };
+
+        let (work_w, work_h) = (working_img.width(), working_img.height());
 
         // 1. 文本行定位检测 (PP-OCRv6 DBNet)
         let t_det = Instant::now();
-        let det_boxes = self.detector.detect(img)?;
+        let det_boxes = self.detector.detect(&working_img)?;
         let det_ms = t_det.elapsed().as_millis();
 
         // 2. 文本行切片裁剪与字符识别 (PP-OCRv6 SVTR)
         let t_rec = Instant::now();
-        use rayon::prelude::*;
-        let crops: Vec<(DynamicImage, [f32; 4])> = det_boxes
-            .par_iter()
-            .map(|b| {
-                let coords = b.to_array();
-                let crop = ImagePreprocessor::crop_box(img, &coords);
-                (crop, coords)
-            })
-            .collect();
-        let boxes = self.recognizer.recognize_batch(&crops);
+        let mut crops = Vec::with_capacity(det_boxes.len());
+        for b in &det_boxes {
+            let coords = b.to_array();
+            let crop = ImagePreprocessor::crop_box(&working_img, &coords);
+            crops.push((crop, coords));
+        }
+        let mut boxes = self.recognizer.recognize_batch(&crops);
         let rec_ms = t_rec.elapsed().as_millis();
 
         // 3. 表格结构预测 (若开启 table feature 且引擎配置启用)
@@ -88,7 +103,7 @@ impl Engine {
         #[cfg(feature = "table")]
         let table_res = if self.config.enable_table {
             self.table_predictor.as_ref().and_then(|p| {
-                match p.predict(img) {
+                match p.predict(&working_img) {
                     Ok(res) => Some(res),
                     Err(e) => {
                         tracing::warn!("表格结构预测失败，将降级为常规文本排版: {e}");
@@ -104,17 +119,30 @@ impl Engine {
 
         // 4. 端到端 AST 语义语法树与版面还原 (阅读顺序重排、标题定级、表格反填、段落合并)
         let t_layout = Instant::now();
-        let (blocks, markdown) = crate::layout::LayoutEngine::process(
+        let (mut blocks, markdown) = crate::layout::LayoutEngine::process(
             &boxes,
-            (img_w, img_h),
+            (work_w, work_h),
             #[cfg(feature = "table")]
             table_res.as_ref(),
         );
         let layout_ms = t_layout.elapsed().as_millis();
 
+        // 5. 空间几何坐标逆变换：将 working_img 坐标还原回原图物理像素 (orig_w, orig_h)
+        if (scale_factor - 1.0).abs() > 1e-4 && scale_factor > 0.0 {
+            for b in &mut boxes {
+                b.coords[0] /= scale_factor;
+                b.coords[1] /= scale_factor;
+                b.coords[2] /= scale_factor;
+                b.coords[3] /= scale_factor;
+            }
+            for block in &mut blocks {
+                block.rescale(scale_factor);
+            }
+        }
+
         let page = PageResult {
             page_index: 0,
-            dimensions: (img_w, img_h),
+            dimensions: (orig_w, orig_h),
             blocks,
             boxes,
         };
@@ -123,13 +151,13 @@ impl Engine {
 
         #[cfg(feature = "table")]
         eprintln!(
-            "[anyocr 阶段耗时] 分辨率: {}x{} | 检测: {}ms ({}行) | 识别: {}ms | 表格: {}ms | 排版: {}ms | 端到端: {}ms",
-            img_w, img_h, det_ms, det_boxes.len(), rec_ms, table_ms, layout_ms, elapsed_ms
+            "[anyocr 阶段耗时] 原图: {}x{} (推理视窗: {}x{}) | 检测: {}ms ({}行) | 识别: {}ms | 表格: {}ms | 排版: {}ms | 端到端: {}ms",
+            orig_w, orig_h, work_w, work_h, det_ms, det_boxes.len(), rec_ms, table_ms, layout_ms, elapsed_ms
         );
         #[cfg(not(feature = "table"))]
         eprintln!(
-            "[anyocr 阶段耗时] 分辨率: {}x{} | 检测: {}ms ({}行) | 识别: {}ms | 排版: {}ms | 端到端: {}ms",
-            img_w, img_h, det_ms, det_boxes.len(), rec_ms, layout_ms, elapsed_ms
+            "[anyocr 阶段耗时] 原图: {}x{} (推理视窗: {}x{}) | 检测: {}ms ({}行) | 识别: {}ms | 排版: {}ms | 端到端: {}ms",
+            orig_w, orig_h, work_w, work_h, det_ms, det_boxes.len(), rec_ms, layout_ms, elapsed_ms
         );
 
         Ok(ParsedDocument {

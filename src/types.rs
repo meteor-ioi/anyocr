@@ -18,10 +18,10 @@ pub enum DocumentFormat {
 /// 模型规格与场景档案
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ModelProfile {
-    /// 极速轻量 (PP-OCRv6-mobile / INT8)，内存低至 ~15MB，适合边缘与 CLI 快速粗扫
-    Fast,
-    /// 标准平衡 (PP-OCRv6-medium，默认推荐)，兼顾识别率与推理吞吐
+    /// 极速轻量 (PP-OCRv6-small，默认推荐)，兼顾高精度与高并发极速响应 (~500ms)
     #[default]
+    Fast,
+    /// 标准平衡 (PP-OCRv6-medium)，面向古籍与超模糊极端抗噪场景
     Standard,
     /// 工业高精 (PP-OCRv6-server)，面向财报密集小字、模糊单据与生僻字
     Accurate,
@@ -37,18 +37,19 @@ pub enum ModelProfile {
 /// 硬件加速提供者
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExecutionProvider {
-    /// 智能探测 (Mac 优先 CoreML，Windows 优先 DirectML，Linux 优先 CUDA，回退 CPU)
+    /// 智能探测 (Mac 优先 CoreML，Linux 优先 CUDA，回退 CPU)
     #[default]
     Auto,
     /// 纯 CPU SIMD 推理
     Cpu,
     /// Apple Silicon CoreML 神经计算加速
     CoreML,
-    /// Windows DirectML GPU 加速 (带 GPU 设备编号)
+    /// Windows DirectML GPU 硬件加速 (带 GPU 设备编号)
     DirectML(i32),
     /// Nvidia CUDA GPU 加速 (带 GPU 设备编号)
     Cuda(i32),
 }
+
 
 /// 引擎运行时配置
 #[derive(Debug, Clone)]
@@ -61,18 +62,22 @@ pub struct EngineConfig {
     pub enable_table: bool,
     /// 识别 (Rec) 分桶批处理的最大 Batch Size
     pub max_batch_size: usize,
+    /// 单页输入图像最长边自适应上限钳制保护 (防止超大扫描图导致内存激增，默认 2560px；设为 None 禁用)
+    pub max_dimension: Option<u32>,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            profile: ModelProfile::Standard,
+            profile: ModelProfile::Fast,
             provider: ExecutionProvider::Auto,
             enable_table: true,
             max_batch_size: 16,
+            max_dimension: Some(2560),
         }
     }
 }
+
 
 /// AST 块节点抽象 (借鉴 Pandoc/MinerU，用于结构化版面还原)
 #[derive(Debug, Clone, Serialize, Deserialize)]

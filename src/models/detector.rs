@@ -43,25 +43,12 @@ pub struct TextDetector {
 }
 
 impl TextDetector {
-    /// 从 ONNX 模型文件构建检测器 (默认 Auto 硬件探测加速)
-    pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self, AnyOcrError> {
-        Self::from_file_with_provider(model_path, crate::types::ExecutionProvider::Auto)
-    }
-
-    /// 从 ONNX 模型文件与指定硬件执行提供者构建检测器
-    pub fn from_file_with_provider(
+    /// 从 ONNX 模型文件构建检测器 (支持指定硬件加速模式)
+    pub fn from_file(
         model_path: impl AsRef<Path>,
         provider: crate::types::ExecutionProvider,
     ) -> Result<Self, AnyOcrError> {
-        let path_ref = model_path.as_ref();
-        if !path_ref.exists() {
-            return Err(AnyOcrError::ModelNotReady(format!(
-                "文本检测模型不存在: {}",
-                path_ref.display()
-            )));
-        }
-
-        let session = crate::models::session::build_session(path_ref, provider)?;
+        let session = crate::models::session::build_session(model_path, provider)?;
 
         Ok(Self {
             session: Mutex::new(session),
@@ -71,6 +58,7 @@ impl TextDetector {
             max_side_len: 960,
         })
     }
+
 
     /// 执行单张图像的文本行定位
     pub fn detect(&self, img: &DynamicImage) -> Result<Vec<DetBox>, AnyOcrError> {
@@ -120,29 +108,29 @@ impl TextDetector {
         height: usize,
         info: &ResizeInfo,
     ) -> Vec<DetBox> {
-        // 1. 二值化掩膜
-        let mut binary_mask = vec![false; width * height];
-        for (i, &p) in prob_map.iter().enumerate() {
-            if p >= self.thresh {
-                binary_mask[i] = true;
-            }
+        // 1. 复用栈与连续连通分量存储 (Zero-allocation DFS CCL)
+        struct RawComponent {
+            min_x: usize,
+            min_y: usize,
+            max_x: usize,
+            max_y: usize,
+            score_sum: f32,
+            count: u32,
         }
 
-        // 2. 连通块染色 (Connected Component Labeling)
-        let mut labels = vec![0u32; width * height];
-        let mut current_label = 0u32;
-        let mut components: std::collections::HashMap<u32, (usize, usize, usize, usize, f32, u32)> =
-            std::collections::HashMap::new();
+        let total_pixels = width * height;
+        let mut visited = vec![false; total_pixels];
+        let mut stack: Vec<(usize, usize)> = Vec::with_capacity(1024);
+        let mut components: Vec<RawComponent> = Vec::with_capacity(128);
 
         for y in 0..height {
+            let row_offset = y * width;
             for x in 0..width {
-                let idx = y * width + x;
-                if binary_mask[idx] && labels[idx] == 0 {
-                    current_label += 1;
-                    // BFS 填充连通分量
-                    let mut queue = std::collections::VecDeque::new();
-                    queue.push_back((x, y));
-                    labels[idx] = current_label;
+                let idx = row_offset + x;
+                if prob_map[idx] >= self.thresh && !visited[idx] {
+                    visited[idx] = true;
+                    stack.clear();
+                    stack.push((x, y));
 
                     let mut min_x = x;
                     let mut max_x = x;
@@ -151,7 +139,7 @@ impl TextDetector {
                     let mut score_sum = prob_map[idx];
                     let mut point_count = 1u32;
 
-                    while let Some((cx, cy)) = queue.pop_front() {
+                    while let Some((cx, cy)) = stack.pop() {
                         let neighbors = [
                             (cx.wrapping_sub(1), cy),
                             (cx + 1, cy),
@@ -162,9 +150,9 @@ impl TextDetector {
                         for (nx, ny) in neighbors {
                             if nx < width && ny < height {
                                 let n_idx = ny * width + nx;
-                                if binary_mask[n_idx] && labels[n_idx] == 0 {
-                                    labels[n_idx] = current_label;
-                                    queue.push_back((nx, ny));
+                                if prob_map[n_idx] >= self.thresh && !visited[n_idx] {
+                                    visited[n_idx] = true;
+                                    stack.push((nx, ny));
 
                                     min_x = min_x.min(nx);
                                     max_x = max_x.max(nx);
@@ -177,26 +165,30 @@ impl TextDetector {
                         }
                     }
 
-                    components.insert(
-                        current_label,
-                        (min_x, min_y, max_x, max_y, score_sum, point_count),
-                    );
+                    components.push(RawComponent {
+                        min_x,
+                        min_y,
+                        max_x,
+                        max_y,
+                        score_sum,
+                        count: point_count,
+                    });
                 }
             }
         }
 
-        // 3. 过滤过小面积或低置信度的框，并执行膨胀与坐标映射
-        let mut det_boxes = Vec::new();
+        // 2. 过滤过小面积或低置信度的框，并执行膨胀与坐标映射
+        let mut det_boxes = Vec::with_capacity(components.len());
 
-        for (_, (min_x, min_y, max_x, max_y, score_sum, count)) in components {
-            let bw = (max_x - min_x + 1) as f32;
-            let bh = (max_y - min_y + 1) as f32;
+        for comp in components {
+            let bw = (comp.max_x - comp.min_x + 1) as f32;
+            let bh = (comp.max_y - comp.min_y + 1) as f32;
 
             if bw < 4.0 || bh < 4.0 {
                 continue;
             }
 
-            let avg_score = score_sum / count as f32;
+            let avg_score = comp.score_sum / comp.count as f32;
             if avg_score < self.box_thresh {
                 continue;
             }
@@ -205,10 +197,10 @@ impl TextDetector {
             let expand_x = (bw * (self.unclip_ratio - 1.0) / 2.0).max(1.0);
             let expand_y = (bh * (self.unclip_ratio - 1.0) / 2.0).max(1.0);
 
-            let unclipped_x1 = (min_x as f32 - expand_x).max(0.0);
-            let unclipped_y1 = (min_y as f32 - expand_y).max(0.0);
-            let unclipped_x2 = (max_x as f32 + expand_x).min(width as f32);
-            let unclipped_y2 = (max_y as f32 + expand_y).min(height as f32);
+            let unclipped_x1 = (comp.min_x as f32 - expand_x).max(0.0);
+            let unclipped_y1 = (comp.min_y as f32 - expand_y).max(0.0);
+            let unclipped_x2 = (comp.max_x as f32 + expand_x).min(width as f32);
+            let unclipped_y2 = (comp.max_y as f32 + expand_y).min(height as f32);
 
             // 逆变换到原图物理像素坐标
             let orig_x1 = (unclipped_x1 / info.scale_x).min(info.original_width as f32);
