@@ -146,13 +146,72 @@ anyocr = { version = "0.1", default-features = false }
 
 | Profile | 规格推荐 | 内存占用 | 适用场景 |
 | :--- | :--- | :---: | :--- |
-| `ModelProfile::Fast` | PP-OCRv6-mobile / INT8 | ~15MB | 边缘设备、轻量 CLI 粗扫、低配云主机 |
-| `ModelProfile::Standard` | PP-OCRv6-medium (默认) | ~80MB | 通用文档、增值税发票、合同单据、公文 |
-| `ModelProfile::Accurate` | PP-OCRv6-server | ~160MB | 密集数字财报、模糊翻拍单据、专业生僻字 |
-| `ModelProfile::Custom` | 外部自定义权重 | 自定义 | 挂载企业微调私有模型与特定语种字典 |
+| `ModelProfile::Fast` | PP-OCRv6-small (默认推荐) | ~20MB | 极速响应 (~500ms)、高并发服务、轻量 CLI 交互 |
+| `ModelProfile::Standard` | PP-OCRv6-medium | ~80MB | 通用文档、古籍生僻字、超模糊极端抗噪场景 |
+| `ModelProfile::Accurate` | PP-OCRv6-server | ~160MB | 密集数字财报、超高精度翻拍单据 |
+| `ModelProfile::Custom` | 外部自定义权重 | 自定义 | 挂载企业私有微调模型与小语种专有识别器 |
 
 ---
 
-## 7. 许可证
+## 7. 多语种与小语种扩展指南 (Multilingual Support)
+
+`anyocr` 的文本定位检测（DBNet）与表格拓扑预测（SLANet）均为**语言无关（Language-Agnostic）**设计，无论输入是何种语言，均能精准定位文字行并还原版面。
+
+### 7.1 原生内置语种（零额外依赖）
+默认预置的 `PP-OCRv6` 字典已混合覆盖 **18,710 字符**：
+- **中文**：简体中文通用全量字库、繁体中文、生僻字与异体字；
+- **英文及拉丁语族**：英语、法语、德语、意大利语、西班牙语、葡萄牙语等完整变音重音符；
+- **日文**：日文汉字、平假名、片假名。
+
+### 7.2 扩展其他 80+ 种全球小语种
+对于韩语、俄语、泰语、阿拉伯语、印地语等特定小语种，可直接复用 [RapidAI 魔搭社区 (ModelScope)](https://www.modelscope.cn/models/RapidAI/RapidOCR/files) 预先转换好的开箱即用 `.onnx` 模型与配套字典。
+
+#### 步骤一：从魔搭下载小语种 ONNX 权重与字典
+以韩语（Korean）为例：
+```bash
+# 1. 下载韩语 ONNX 识别模型 (约 10MB)
+curl -L "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile.onnx" \
+     -o models/ocr/korean_PP-OCRv5_rec_mobile.onnx
+
+# 2. 下载配对字典
+curl -L "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile/ppocrv5_korean_dict.txt" \
+     -o models/ocr/ppocrv5_korean_dict.txt
+```
+
+> 常用语种目录对照（魔搭 `RapidAI/RapidOCR` 仓库）：
+> - **韩语**：`onnx/PP-OCRv5/rec/korean_PP-OCRv5_rec_mobile.onnx`
+> - **泰语**：`onnx/PP-OCRv5/rec/th_PP-OCRv5_rec_mobile.onnx`
+> - **拉丁扩展 (越/波/捷/土等)**：`onnx/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile.onnx`
+> - **泰米尔语 / 泰卢固语**：`onnx/PP-OCRv5/rec/ta_...` / `te_...`
+
+#### 步骤二：通过 `ModelProfile::Custom` 零代码无缝挂载
+```rust
+use anyocr::{Engine, EngineConfig, ModelProfile, DocumentFormat};
+use std::path::PathBuf;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = EngineConfig {
+        profile: ModelProfile::Custom {
+            // 复用通用超轻量检测与表格模型
+            det_path: PathBuf::from("models/ocr/PP-OCRv6_det_small.onnx"),
+            table_path: Some(PathBuf::from("models/ocr/slanet-plus.onnx")),
+            // 挂载小语种识别器与字典
+            rec_path: PathBuf::from("models/ocr/korean_PP-OCRv5_rec_mobile.onnx"),
+            dict_path: Some(PathBuf::from("models/ocr/ppocrv5_korean_dict.txt")),
+        },
+        ..Default::default()
+    };
+
+    let engine = Engine::new(config)?;
+    let doc = engine.parse(&std::fs::read("korean_doc.pdf")?, DocumentFormat::Pdf)?;
+    println!("{}", doc.markdown);
+    Ok(())
+}
+```
+
+---
+
+## 8. 许可证
 
 本项目遵循 [MIT License](LICENSE-MIT) 或 [Apache-2.0 License](LICENSE-APACHE)。
+
