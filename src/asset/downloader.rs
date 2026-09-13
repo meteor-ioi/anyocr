@@ -57,10 +57,9 @@ impl ModelPaths {
             ModelProfile::Standard | ModelProfile::Fast | ModelProfile::Accurate => {
                 let cache_dir = get_default_cache_dir();
                 let local_dir = PathBuf::from("models").join("ocr");
-                let sensidoc_dir = PathBuf::from("/Users/icychick/Projects/SensiDoc-ocr/models/ocr");
 
-                // 优先顺序：本地 models/ocr ➔ SensiDoc 开发路径 ➔ 系统 ~/.cache 目录
-                let search_dirs = [local_dir, sensidoc_dir, cache_dir];
+                // 优先顺序：本地工作目录 models/ocr ➔ 系统/环境变量缓存目录 (ANYOCR_CACHE_DIR 或 ~/.cache/anyocr/models)
+                let search_dirs = [local_dir, cache_dir];
 
                 let rec_filename = match profile {
                     ModelProfile::Fast => REC_MOBILE_FILENAME,
