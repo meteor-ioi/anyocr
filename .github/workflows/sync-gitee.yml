@@ -1,0 +1,21 @@
+name: Sync to Gitee Mirror
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "*" ]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Mirror to Gitee
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to Gitee
+        run: |
+          git push --prune --tags "https://icychick:${{ secrets.GITEE_TOKEN }}@gitee.com/icychick/anyocr.git" "+refs/heads/*:refs/heads/*"
