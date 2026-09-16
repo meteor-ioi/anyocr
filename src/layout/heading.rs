@@ -27,7 +27,7 @@ impl HeadingClassifier {
     /// 判定一个文本框是否是标题，若是则返回对应 Markdown 级别 (1 ~ 6)
     pub fn classify_heading(item: &TextBoxItem, body_median_height: f32) -> Option<u8> {
         let text = item.text.trim();
-        if text.is_empty() {
+        if text.is_empty() || text.starts_with('-') || text.starts_with('+') || text.starts_with('*') || text.starts_with('~') || text.starts_with('=') {
             return None;
         }
 

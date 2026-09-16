@@ -12,12 +12,58 @@ pub struct TableMatcher;
 
 impl TableMatcher {
     #[cfg(feature = "table")]
+    /// 检验 SLANet 预测的表格骨架质量与可用性
+    pub fn is_slanet_valid(table_res: &TableStructureResult, texts: &[TextBoxItem]) -> bool {
+        if table_res.cell_boxes.is_empty() || table_res.html_tokens.is_empty() {
+            return false;
+        }
+
+        // 统计落入各单元格的文本框数量与空间分布
+        let mut cell_item_counts: HashMap<usize, usize> = HashMap::new();
+        let mut cell_y_ranges: HashMap<usize, (f32, f32)> = HashMap::new();
+
+        for item in texts {
+            let cx = (item.coords[0] + item.coords[2]) / 2.0;
+            let cy = (item.coords[1] + item.coords[3]) / 2.0;
+
+            for cell in &table_res.cell_boxes {
+                if cx >= cell.x1 && cx <= cell.x2 && cy >= cell.y1 && cy <= cell.y2 {
+                    *cell_item_counts.entry(cell.cell_idx).or_insert(0) += 1;
+                    let entry = cell_y_ranges.entry(cell.cell_idx).or_insert((cy, cy));
+                    entry.0 = entry.0.min(cy);
+                    entry.1 = entry.1.max(cy);
+                    break;
+                }
+            }
+        }
+
+        // 1. 检查是否存在巨型异常单元格吞噬大量文本
+        let total_text_count = texts.len();
+        for (&_cell_idx, &count) in &cell_item_counts {
+            // 单个单元格吞噬超过 15 个文本框且占整页文本框 35% 以上，说明发生了灾难性欠分割 (如畸形 rowspan="14")
+            if count >= 15 && total_text_count >= 20 && (count as f32 / total_text_count as f32) > 0.35 {
+                return false;
+            }
+        }
+
+        // 2. 检查单元格利用率
+        let total_cells = table_res.cell_boxes.len();
+        let filled_cells = cell_item_counts.len();
+        if total_cells >= 20 && filled_cells <= 3 {
+            // 骨架预测严重失真
+            return false;
+        }
+
+        true
+    }
+
+    #[cfg(feature = "table")]
     /// 将 OCR 文本与 SLANet 表格预测结果进行空间对齐与多块划分
     pub fn match_and_build(
         table_res: &TableStructureResult,
         texts: &[TextBoxItem],
     ) -> (Vec<TextBoxItem>, Option<DocBlock>, Vec<TextBoxItem>) {
-        if table_res.cell_boxes.is_empty() || table_res.html_tokens.is_empty() {
+        if !Self::is_slanet_valid(table_res, texts) {
             return (texts.to_vec(), None, Vec::new());
         }
 
@@ -173,7 +219,7 @@ fn html_escape(text: &str) -> String {
 
 /// 尝试将不含复杂合并的标准 HTML `<table>` 转换为 GFM 管道符表格
 #[cfg(any(feature = "table", test))]
-fn try_convert_to_gfm(html: &str) -> Option<String> {
+pub fn try_convert_to_gfm(html: &str) -> Option<String> {
     if html.contains("rowspan") || html.contains("colspan") {
         return None;
     }

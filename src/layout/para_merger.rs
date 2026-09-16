@@ -20,6 +20,27 @@ impl ParagraphMerger {
         }
     }
 
+    /// 判定一行是否为独立的单据键值对 (Key-Value) 或标签行
+    pub fn is_key_value_line(text: &str) -> bool {
+        let trimmed = text.trim();
+        // 含有冒号且冒号前字符长度 <= 25 (典型 KV 键)
+        if let Some(colon_pos) = trimmed.find(':').or_else(|| trimmed.find('：')) {
+            let key_part = &trimmed[..colon_pos];
+            if !key_part.is_empty() && key_part.chars().count() <= 25 {
+                return true;
+            }
+        }
+
+        // 单据表单常见独立标签
+        let tags = [
+            "PAYEE", "NAME", "DEPT", "DATE", "BANK", "SWIFT", "ACCOUNT", "JOURNAL",
+            "APPLIED BY", "CHECKED BY", "APPROVED BY", "VERIFIED BY", "SIGN&DATE",
+            "姓名", "部门", "日期", "开户行", "账号", "申请人", "确认人", "审核人", "核批人", "签收人"
+        ];
+        let upper = trimmed.to_uppercase();
+        tags.iter().any(|&t| upper.starts_with(t) || upper.ends_with(t))
+    }
+
     /// 智能拼接两行文本（中文字符无缝连接，英文字符补充单个空格）
     pub fn join_text_smart(first: &str, second: &str) -> String {
         let t1 = first.trim_end();
@@ -107,15 +128,20 @@ impl ParagraphMerger {
                 continue;
             }
 
-            // 2. 判定是否与当前段落合并
+            // 2. 检查是否为独立的键值对行 (避免单据字段被粗暴拼成一大段)
+            let is_kv = Self::is_key_value_line(text);
+
+            // 3. 判定是否与当前段落合并
             if let Some(last_item) = current_para.last() {
                 let vertical_dist = (item.coords[1] - last_item.coords[3]).max(0.0);
                 let is_stopped = Self::ends_with_stop_flag(&last_item.text);
+                let last_is_kv = Self::is_key_value_line(&last_item.text);
 
-                // 启发式跨行条件：
+                // 启发式跨行合并条件：
                 // a) 上一行未结束断句
-                // b) 行间距不超过基准行高的 1.6 倍
-                if !is_stopped && vertical_dist <= 1.6 * median_height {
+                // b) 两行均非独立键值对标签
+                // c) 行间距不超过基准行高的 1.5 倍
+                if !is_stopped && !is_kv && !last_is_kv && vertical_dist <= 1.5 * median_height {
                     current_para.push(item.clone());
                 } else {
                     // 结算上一段落并开启新段落
