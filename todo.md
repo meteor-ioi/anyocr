@@ -14,7 +14,8 @@
 | **Milestone 4** | SensiDoc 回归集成与开源发布 | ✅ 全部完成 | SensiDoc 瘦身解耦 (32 项测试全绿), CI 跨平台流水线, 社区交付 |
 | **Milestone 5** | 推理性能加速与硬件加速打通 (Performance Optimization) | ✅ 全部完成 | EP 硬件加速、SIMD 连续内存预处理、CCL 优化与动态 Batch |
 | **Milestone 6** | 多页文档流水线并发加速与规格基准 (Multi-page Pipelining) | ✅ 全部完成 | PDF 并发提取/旋转校正、Fast 规格实测 (提速 70%+) |
-| **Milestone 7** | 图像自适应尺寸保护与分辨率优化 (Smart Clamping) | 🚀 进行中 | 超大输入保护、自适应降采样、空间坐标一致性 |
+| **Milestone 7** | 图像自适应尺寸保护与分辨率优化 (Smart Clamping) | ✅ 全部完成 | 超大输入保护、自适应降采样、空间坐标一致性 |
+| **Milestone 8** | 复合单据网格重构与多表格流式版面引擎 (Composite Layout) | ✅ 全部完成 | GridTableBuilder、SLANet 熔断、多表格流式交织、键值对保护 |
 
 
 
@@ -203,3 +204,29 @@
 - [x] **7.4 精度与耗时回归基准验收**
   - [x] 运行单图冒烟与 `examples/benchmark_superl.rs` 验证（Fast 模式下密集单据由 3.24s 进一步降至 3.06s）
   - [x] 保证 13 项单元测试全绿通过
+
+---
+
+### Milestone 8：复合单据网格重构与多表格流式版面引擎 (Composite Layout & Grid Tables)
+
+- [x] **8.1 SLANet 骨架质量检验与欠分割异常熔断 (`src/layout/table_matcher.rs`)**
+  - [x] 深入排查整页复合单据输入 SLANet 产生畸形 `rowspan="14"` 吞噬全页 200+ 文字框的缺陷
+  - [x] 增加 `TableMatcher::is_slanet_valid` 质量检验（检测巨型单单元格与单元格极低利用率），自动熔断降级
+
+- [x] **8.2 引入启发式坐标网格表格构建器 (`src/layout/grid_table.rs`)**
+  - [x] 基于 OCR 物理坐标 `[x1, y1, x2, y2]` 投影实现 Y 轴逻辑行聚类 (`cluster_into_rows`)
+  - [x] 基于多列特征与表头关键词实现表格区域智能发现 (`find_table_row_ranges`)
+  - [x] 基于 1D 空间密度聚类划分列区间 (`compute_column_intervals`)，高精还原 33 行规整 GFM 表格
+
+- [x] **8.3 多表格与复合版面流式交织组装 (`src/layout/mod.rs`)**
+  - [x] 废弃全局单表格假设，升级为多表格与正文流式交织组装管线 (`process_multi_table_flow`)
+  - [x] 支持单页单据中同时包含表头、33行明细表、银行信息、审批表、手写笔迹并保序输出
+
+- [x] **8.4 单据键值对保护与标题前缀规范 (`src/layout/para_merger.rs` & `src/layout/heading.rs`)**
+  - [x] 增强 `is_key_value_line` 保护单据字段标签，防止单据字段被折行误合并
+  - [x] 排除公式与列表前缀，确保手写笔记作为自然正文输出
+
+- [x] **8.5 单元测试与端到端回归验收**
+  - [x] 14 项单元测试 100% 通过（新增 `test_grid_table_extraction`）
+  - [x] SensiDoc 实机端到端全链路回归通过
+
