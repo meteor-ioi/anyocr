@@ -201,9 +201,44 @@ impl TableMatcher {
             table_body
         };
 
-        let sanitized_table = table_html
+        let raw_table = table_html
             .replace("<td></td> rowspan=", "<td rowspan=")
             .replace("<td></td> colspan=", "<td colspan=");
+
+        // 自动清除 HTML 表格中没有任何文字内容的纯空行 (如 <tr><td></td></tr>、<tr><td colspan="2"></td></tr>)
+        use std::sync::LazyLock;
+        static TR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"(?is)<tr\b[^>]*>.*?</tr>").expect("合法正则")
+        });
+        static TAG_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"<[^>]+>").expect("合法正则")
+        });
+        static TABLE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"(?is)<table\b[^>]*>.*?</table>").expect("合法正则")
+        });
+
+        let no_empty_trs = TR_RE.replace_all(&raw_table, |caps: &regex::Captures| {
+            let tr_str = &caps[0];
+            let stripped = TAG_RE.replace_all(tr_str, "");
+            let clean = stripped.replace("&nbsp;", " ").replace("&#160;", " ").trim().to_string();
+            if clean.is_empty() {
+                String::new()
+            } else {
+                tr_str.to_string()
+            }
+        });
+
+        // 若整张表格的所有行均为空行，直接清除该空表格
+        let sanitized_table = TABLE_RE.replace_all(&no_empty_trs, |caps: &regex::Captures| {
+            let t_str = &caps[0];
+            let stripped = TAG_RE.replace_all(t_str, "");
+            let clean = stripped.replace("&nbsp;", " ").replace("&#160;", " ").trim().to_string();
+            if clean.is_empty() {
+                String::new()
+            } else {
+                t_str.to_string()
+            }
+        }).to_string();
 
         let gfm = try_convert_to_gfm(&sanitized_table).unwrap_or_default();
         (gfm, sanitized_table)
