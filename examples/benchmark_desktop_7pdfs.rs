@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_start = Instant::now();
     let mut total_pages_processed = 0;
     let mut total_tables_detected = 0;
+    let mut total_cells_extracted = 0;
     let mut total_text_boxes = 0;
 
     println!("======================================================================");
@@ -72,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let doc_start = Instant::now();
         let mut doc_markdown_pages = vec![format!("# {}\n\n*生成引擎: AnyOCR 原生 Rust 双轨版面识别 (PicoDet-S + PP-OCRv6 + SLANet+)*\n", stem)];
         let mut doc_tables = 0;
+        let mut doc_cells = 0;
         let mut doc_boxes = 0;
 
         for p in 1..=*expected_pages {
@@ -87,23 +89,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let p_elapsed = p_start.elapsed().as_secs_f64();
 
             let mut page_tables = 0;
+            let mut page_cells = 0;
             let mut page_boxes = 0;
             for page in &parsed.pages {
                 page_boxes += page.boxes.len();
                 for block in &page.blocks {
-                    if matches!(block, anyocr::DocBlock::Table { .. }) {
+                    if let anyocr::DocBlock::Table { raw_html, markdown_table, .. } = block {
                         page_tables += 1;
+                        if let Some(html) = raw_html {
+                            page_cells += html.matches("<td").count();
+                        } else {
+                            page_cells += markdown_table.matches('|').count() / 2;
+                        }
                     }
                 }
             }
 
             doc_tables += page_tables;
+            doc_cells += page_cells;
             doc_boxes += page_boxes;
             doc_markdown_pages.push(format!("### 第 {} 页\n\n{}\n", p, parsed.markdown));
 
             println!(
-                "  - 第 {:>2}/{:>2} 页: 耗时 {:>4.2}s | 表格: {:>1} 个 | 文字框: {:>3} 个 | 内存: {:>6.1} MB",
-                p, expected_pages, p_elapsed, page_tables, page_boxes, get_peak_memory_mb()
+                "  - 第 {:>2}/{:>2} 页: 耗时 {:>4.2}s | 表格: {:>1} 个 | 单元格: {:>3} 个 | 文字框: {:>3} 个 | 内存: {:>6.1} MB",
+                p, expected_pages, p_elapsed, page_tables, page_cells, page_boxes, get_peak_memory_mb()
             );
         }
 
@@ -114,12 +123,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let avg_page_sec = doc_elapsed / *expected_pages as f64;
         println!(
-            "  ✨ 文档完成！总耗时: {:>5.2}s (平均 {:>4.2}s/页) | 表格: {:>2} 张 | 文字框: {:>4} | Markdown 已输出",
-            doc_elapsed, avg_page_sec, doc_tables, doc_boxes
+            "  ✨ 文档完成！总耗时: {:>5.2}s (平均 {:>4.2}s/页) | 表格: {:>2} 张 | 单元格: {:>4} | 文字框: {:>4} | Markdown 已输出",
+            doc_elapsed, avg_page_sec, doc_tables, doc_cells, doc_boxes
         );
 
         total_pages_processed += expected_pages;
         total_tables_detected += doc_tables;
+        total_cells_extracted += doc_cells;
         total_text_boxes += doc_boxes;
     }
 
@@ -132,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("• 处理文档总数    : {} 份", target_pdfs.len());
     println!("• 处理页面总数    : {} 页", total_pages_processed);
     println!("• 检出结构化表格  : {} 张", total_tables_detected);
+    println!("• 提取物理单元格  : {} 个 (SLANet_plus 结构保真)", total_cells_extracted);
     println!("• 提取识别文本框  : {} 个 (含物理绝对点坐标)", total_text_boxes);
     println!("• 纯 CPU 总耗时   : {:.2} 秒 ({:.1} 分钟)", total_elapsed, total_elapsed / 60.0);
     println!("• 全局平均单页速度: {:.2} 秒 / 页", total_elapsed / total_pages_processed as f64);

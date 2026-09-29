@@ -154,50 +154,33 @@ impl TextRecognizer {
             return Vec::new();
         }
 
-        // 1. 计算每个切片的目标宽度并按宽高比划入 4 个桶
-        // Bucket 0 (短文本):   <= 120px (~1-4 字符)
-        // Bucket 1 (中等文本): 121..=320px (~5-12 字符)
-        // Bucket 2 (长文本):   321..=640px (~13-25 字符)
-        // Bucket 3 (超长文本): > 640px
-        let mut buckets: [Vec<(usize, &DynamicImage, [f32; 4], u32)>; 4] = [
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ];
-
+        // 1. 计算每个切片的目标宽度 (保证在 [16, 960] 之间，防止畸形扁长图像产生超大无效 Tensor)
+        let mut sorted_crops: Vec<(usize, &DynamicImage, [f32; 4], u32)> = Vec::with_capacity(crops.len());
         for (idx, (crop, bbox)) in crops.iter().enumerate() {
             let (w, h) = crop.dimensions();
             let ratio = 48.0 / h.max(1) as f32;
-            let target_w = ((w as f32 * ratio) as u32).max(16);
-
-            let bucket_idx = match target_w {
-                0..=120 => 0,
-                121..=320 => 1,
-                321..=640 => 2,
-                _ => 3,
-            };
-
-            buckets[bucket_idx].push((idx, crop, *bbox, target_w));
+            let target_w = ((w as f32 * ratio).round() as u32).clamp(16, 960);
+            sorted_crops.push((idx, crop, *bbox, target_w));
         }
+
+        // 按 target_w 升序排序，使同一个 batch 内的切片宽度紧密贴合，彻底消除无效 padding 膨胀
+        sorted_crops.sort_unstable_by_key(|item| item.3);
 
         let mut all_results: Vec<(usize, TextBoxItem)> = Vec::with_capacity(crops.len());
         let batch_size = self.max_batch_size;
 
-        // 2. 分桶批量前向推理
-        for bucket in &buckets {
-            for chunk in bucket.chunks(batch_size) {
-                match self.recognize_chunk(chunk) {
-                    Ok(batch_res) => {
-                        all_results.extend(batch_res);
-                    }
-                    Err(e) => {
-                        tracing::warn!("分桶批处理推理失败，自动平滑降级到逐行识别: {e}");
-                        for &(orig_idx, crop, bbox, _) in chunk {
-                            if let Ok((text, score)) = self.recognize_crop(crop) {
-                                if !text.trim().is_empty() {
-                                    all_results.push((orig_idx, TextBoxItem { text, score, coords: bbox }));
-                                }
+        // 2. 紧凑批处理前向推理
+        for chunk in sorted_crops.chunks(batch_size) {
+            match self.recognize_chunk(chunk) {
+                Ok(batch_res) => {
+                    all_results.extend(batch_res);
+                }
+                Err(e) => {
+                    tracing::warn!("批处理推理失败，自动平滑降级到逐行识别: {e}");
+                    for &(orig_idx, crop, bbox, _) in chunk {
+                        if let Ok((text, score)) = self.recognize_crop(crop) {
+                            if !text.trim().is_empty() {
+                                all_results.push((orig_idx, TextBoxItem { text, score, coords: bbox }));
                             }
                         }
                     }
@@ -206,11 +189,11 @@ impl TextRecognizer {
         }
 
         // 3. 恢复原始切片的几何排序顺序
-        all_results.sort_by_key(|(orig_idx, _)| *orig_idx);
+        all_results.sort_unstable_by_key(|(orig_idx, _)| *orig_idx);
         all_results.into_iter().map(|(_, item)| item).collect()
     }
 
-    /// 对单批同桶切片执行一次性 4D Tensor 前向批处理推理
+    /// 对单批尺寸相近的切片执行一次性 4D Tensor 前向批处理推理
     fn recognize_chunk(
         &self,
         chunk: &[(usize, &DynamicImage, [f32; 4], u32)],
@@ -220,7 +203,7 @@ impl TextRecognizer {
             return Ok(Vec::new());
         }
 
-        // 寻找当前 batch 内的最大宽度作为齐平宽度
+        // 寻找当前 batch 内的最大宽度作为齐平宽度 (经排序后当前 batch 宽高比极度紧凑)
         let max_w = chunk.iter().map(|item| item.3).max().unwrap_or(16).max(16) as usize;
         let mut tensor = ndarray::Array4::<f32>::from_elem((b, 3, 48, max_w), -1.0);
 
@@ -241,17 +224,16 @@ impl TextRecognizer {
             }
         }
 
-
         let cow_array = tensor.into_dyn();
         let input_value = ort::value::Value::from_array(cow_array)
-            .map_err(|e| AnyOcrError::InferenceError(format!("构建分桶批处理 Tensor 失败: {e}")))?;
+            .map_err(|e| AnyOcrError::InferenceError(format!("构建批处理 Tensor 失败: {e}")))?;
 
         let mut session = self.session.lock().map_err(|e| {
             AnyOcrError::InferenceError(format!("获取识别模型锁失败: {e}"))
         })?;
 
         let outputs = session.run(ort::inputs![input_value])
-            .map_err(|e| AnyOcrError::InferenceError(format!("执行分桶批处理推理失败: {e}")))?;
+            .map_err(|e| AnyOcrError::InferenceError(format!("执行批处理推理失败: {e}")))?;
 
         let (_, output_value) = outputs
             .into_iter()

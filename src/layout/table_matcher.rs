@@ -68,39 +68,8 @@ impl TableMatcher {
             return None;
         }
 
-        // 空间反填：计算每个文本中心点落在哪个 CellBox 内
-        let mut cell_texts: HashMap<usize, Vec<String>> = HashMap::new();
-        for item in in_table_texts {
-            let cx = (item.coords[0] + item.coords[2]) / 2.0;
-            let cy = (item.coords[1] + item.coords[3]) / 2.0;
-
-            let mut best_cell: Option<usize> = None;
-            let mut min_dist = f32::INFINITY;
-
-            for cell in &table_res.cell_boxes {
-                if cx >= cell.x1 && cx <= cell.x2 && cy >= cell.y1 && cy <= cell.y2 {
-                    best_cell = Some(cell.cell_idx);
-                    break;
-                }
-                let ccx = (cell.x1 + cell.x2) / 2.0;
-                let ccy = (cell.y1 + cell.y2) / 2.0;
-                let dist = (cx - ccx).hypot(cy - ccy);
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_cell = Some(cell.cell_idx);
-                }
-            }
-
-            if let Some(idx) = best_cell {
-                cell_texts.entry(idx).or_default().push(item.text.trim().to_string());
-            }
-        }
-
-        let mut aggregated_cells: HashMap<usize, String> = HashMap::new();
-        for (idx, list) in cell_texts {
-            aggregated_cells.insert(idx, list.join(" "));
-        }
-
+        // 使用二维重叠面积 (IoF) 与空间拓扑排序分配文本至单元格
+        let aggregated_cells = Self::assign_texts_to_cells(&table_res.cell_boxes, in_table_texts);
         let (gfm, raw_html) = Self::render_tokens_to_markdown(&table_res.html_tokens, &aggregated_cells);
 
         Some(DocBlock::Table {
@@ -156,41 +125,8 @@ impl TableMatcher {
             }
         }
 
-        // 空间反填：计算每个文本中心点落在哪个 CellBox 内
-        let mut cell_texts: HashMap<usize, Vec<String>> = HashMap::new();
-        for item in in_table_texts {
-            let cx = (item.coords[0] + item.coords[2]) / 2.0;
-            let cy = (item.coords[1] + item.coords[3]) / 2.0;
-
-            let mut best_cell: Option<usize> = None;
-            let mut min_dist = f32::INFINITY;
-
-            for cell in &table_res.cell_boxes {
-                if cx >= cell.x1 && cx <= cell.x2 && cy >= cell.y1 && cy <= cell.y2 {
-                    best_cell = Some(cell.cell_idx);
-                    break;
-                }
-                // 若中心点略微在边界外，计算到矩形中心的欧氏距离
-                let ccx = (cell.x1 + cell.x2) / 2.0;
-                let ccy = (cell.y1 + cell.y2) / 2.0;
-                let dist = (cx - ccx).hypot(cy - ccy);
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_cell = Some(cell.cell_idx);
-                }
-            }
-
-            if let Some(idx) = best_cell {
-                cell_texts.entry(idx).or_default().push(item.text.trim().to_string());
-            }
-        }
-
-        // 注入文字并生成干净 HTML / GFM 表格
-        let mut aggregated_cells: HashMap<usize, String> = HashMap::new();
-        for (idx, list) in cell_texts {
-            aggregated_cells.insert(idx, list.join(" "));
-        }
-
+        // 空间反填：使用二维重叠面积 (IoF) 与空间拓扑排序分配文本至单元格
+        let aggregated_cells = Self::assign_texts_to_cells(&table_res.cell_boxes, &in_table_texts);
         let (gfm, raw_html) = Self::render_tokens_to_markdown(&table_res.html_tokens, &aggregated_cells);
 
         let table_block = DocBlock::Table {
@@ -296,6 +232,96 @@ impl TableMatcher {
         let gfm = try_convert_to_gfm(&sanitized_table).unwrap_or_default();
         (gfm, sanitized_table)
     }
+
+    #[cfg(feature = "table")]
+    /// 使用二维面积重叠率 (IoF) 与空间阅读顺序拓扑保序将文本框分配给各个单元格
+    pub fn assign_texts_to_cells(
+        cell_boxes: &[crate::models::table::CellBox],
+        texts: &[TextBoxItem],
+    ) -> HashMap<usize, String> {
+        if cell_boxes.is_empty() || texts.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut cell_items: HashMap<usize, Vec<&TextBoxItem>> = HashMap::new();
+
+        for item in texts {
+            let ix1 = item.coords[0];
+            let iy1 = item.coords[1];
+            let ix2 = item.coords[2];
+            let iy2 = item.coords[3];
+            let item_w = (ix2 - ix1).max(0.0);
+            let item_h = (iy2 - iy1).max(0.0);
+            let item_area = (item_w * item_h).max(1.0);
+
+            let mut best_cell: Option<usize> = None;
+            let mut max_iof = 0.0f32;
+            let mut min_edge_dist = f32::INFINITY;
+            let mut closest_cell: Option<usize> = None;
+
+            for cell in cell_boxes {
+                // 1. 计算文本框与单元格的二维交集面积
+                let inter_x1 = ix1.max(cell.x1);
+                let inter_y1 = iy1.max(cell.y1);
+                let inter_x2 = ix2.min(cell.x2);
+                let inter_y2 = iy2.min(cell.y2);
+
+                let inter_w = (inter_x2 - inter_x1).max(0.0);
+                let inter_h = (inter_y2 - inter_y1).max(0.0);
+                let inter_area = inter_w * inter_h;
+
+                let iof = inter_area / item_area;
+                if iof > max_iof {
+                    max_iof = iof;
+                    best_cell = Some(cell.cell_idx);
+                }
+
+                // 2. 备用：计算中心点到单元格矩形边界的最短几何距离
+                let cx = (ix1 + ix2) / 2.0;
+                let cy = (iy1 + iy2) / 2.0;
+                let dx = if cx < cell.x1 { cell.x1 - cx } else if cx > cell.x2 { cx - cell.x2 } else { 0.0 };
+                let dy = if cy < cell.y1 { cell.y1 - cy } else if cy > cell.y2 { cy - cell.y2 } else { 0.0 };
+                let dist = dx.hypot(dy);
+                if dist < min_edge_dist {
+                    min_edge_dist = dist;
+                    closest_cell = Some(cell.cell_idx);
+                }
+            }
+
+            // 归属决断：若最大重叠率 >= 0.20，判定为该单元格；否则若点到矩形边缘距离小于行高 1.5 倍，归入最近单元格
+            let target_cell = if max_iof >= 0.20 {
+                best_cell
+            } else if min_edge_dist <= item_h * 1.5 {
+                closest_cell.or(best_cell)
+            } else {
+                best_cell.or(closest_cell)
+            };
+
+            if let Some(c_idx) = target_cell {
+                cell_items.entry(c_idx).or_default().push(item);
+            }
+        }
+
+        // 对每个单元格内的文本框按空间阅读顺序几何排序 (先上后下，同行先左后右)
+        let mut aggregated: HashMap<usize, String> = HashMap::new();
+        for (c_idx, mut list) in cell_items {
+            list.sort_by(|a, b| {
+                let a_cy = (a.coords[1] + a.coords[3]) / 2.0;
+                let b_cy = (b.coords[1] + b.coords[3]) / 2.0;
+                let h = (a.coords[3] - a.coords[1]).min(b.coords[3] - b.coords[1]).max(5.0);
+                if (a_cy - b_cy).abs() < h * 0.45 {
+                    a.coords[0].partial_cmp(&b.coords[0]).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    a_cy.partial_cmp(&b_cy).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            });
+
+            let text_parts: Vec<&str> = list.iter().map(|it| it.text.trim()).filter(|s| !s.is_empty()).collect();
+            aggregated.insert(c_idx, text_parts.join(" "));
+        }
+
+        aggregated
+    }
 }
 
 #[cfg(feature = "table")]
@@ -305,13 +331,9 @@ fn html_escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// 尝试将不含复杂合并的标准 HTML `<table>` 转换为 GFM 管道符表格
+/// 将标准或带合并属性的 HTML `<table>` 转换为整齐对齐的 GFM 管道符表格
 #[cfg(any(feature = "table", test))]
 pub fn try_convert_to_gfm(html: &str) -> Option<String> {
-    if html.contains("rowspan") || html.contains("colspan") {
-        return None;
-    }
-
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut current_row: Vec<String> = Vec::new();
     let mut in_td = false;
@@ -330,19 +352,20 @@ pub fn try_convert_to_gfm(html: &str) -> Option<String> {
             }
 
             let tag_lower = tag.to_ascii_lowercase();
-            if tag_lower == "tr" {
+            let tag_name = tag_lower.split_whitespace().next().unwrap_or("");
+            if tag_name == "tr" {
                 current_row = Vec::new();
-            } else if tag_lower == "/tr" {
-                if !current_row.is_empty() {
+            } else if tag_name == "/tr" {
+                if !current_row.is_empty() && current_row.iter().any(|s| !s.trim().is_empty()) {
                     rows.push(current_row.clone());
                 }
-            } else if tag_lower == "td" || tag_lower == "th" {
+            } else if tag_name == "td" || tag_name == "th" || tag_name.starts_with("td") || tag_name.starts_with("th") {
                 in_td = true;
                 current_cell = String::new();
-            } else if tag_lower == "/td" || tag_lower == "/th" {
+            } else if tag_name == "/td" || tag_name == "/th" {
                 in_td = false;
-                current_row.push(current_cell.trim().replace('|', "\\|"));
-            } else if in_td && (tag_lower == "br" || tag_lower.starts_with("br/")) {
+                current_row.push(current_cell.trim().replace('\n', " ").replace('|', "\\|"));
+            } else if in_td && (tag_name == "br" || tag_name.starts_with("br/")) {
                 current_cell.push(' ');
             }
         } else if in_td {
@@ -387,6 +410,14 @@ mod tests {
         let gfm = try_convert_to_gfm(html).unwrap();
         assert!(gfm.contains("| 列1 | 列2 |"));
         assert!(gfm.contains("| --- | --- |"));
+        assert!(gfm.contains("| A | B |"));
+    }
+
+    #[test]
+    fn test_html_with_colspan_to_gfm() {
+        let html = "<table><tr><td colspan=\"2\">合并表头</td></tr><tr><td>A</td><td>B</td></tr></table>";
+        let gfm = try_convert_to_gfm(html).unwrap();
+        assert!(gfm.contains("| 合并表头 |"));
         assert!(gfm.contains("| A | B |"));
     }
 }

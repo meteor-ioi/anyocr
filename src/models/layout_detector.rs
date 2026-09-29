@@ -123,7 +123,7 @@ impl LayoutDetector {
 
         Ok(Self {
             session: Mutex::new(session),
-            score_thresh: 0.35,
+            score_thresh: 0.48,
             target_size: (480, 480),
         })
     }
@@ -210,12 +210,21 @@ impl LayoutDetector {
                 x2 = x2.clamp(0.0, orig_w as f32);
                 y2 = y2.clamp(0.0, orig_h as f32);
 
-                if x2 <= x1 || y2 <= y1 {
+                let bw = x2 - x1;
+                let bh = y2 - y1;
+                if bw <= 1.0 || bh <= 1.0 {
+                    continue;
+                }
+
+                let label = LayoutLabel::from_class_id(cls_id);
+
+                // 过滤微小伪表格碎片 (表格物理尺寸与面积防噪保护)
+                if label == LayoutLabel::Table && (bw < 60.0 || bh < 40.0 || (bw * bh) < 3000.0) {
                     continue;
                 }
 
                 results.push(LayoutBox {
-                    label: LayoutLabel::from_class_id(cls_id),
+                    label,
                     score,
                     x1,
                     y1,

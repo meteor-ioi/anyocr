@@ -72,7 +72,7 @@ impl Default for EngineConfig {
             profile: ModelProfile::Fast,
             provider: ExecutionProvider::Auto,
             enable_table: true,
-            max_batch_size: 16,
+            max_batch_size: 32,
             max_dimension: Some(2560),
         }
     }
