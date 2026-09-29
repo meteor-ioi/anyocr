@@ -48,10 +48,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
+    let num_workers = std::env::var("ANYOCR_WORKERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2)
+        .clamp(1, 4);
+
     let t_init = Instant::now();
-    let engine = Engine::new(config)?;
+    let engines: Vec<std::sync::Arc<Engine>> = (0..num_workers)
+        .map(|i| {
+            println!("  正在初始化 Worker [{}/{}]...", i + 1, num_workers);
+            std::sync::Arc::new(Engine::new(config.clone()).unwrap())
+        })
+        .collect();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_workers)
+        .build()?;
+
     println!(
-        "✅ 引擎初始化就绪！耗时: {:.2}s | 初始物理内存: {:.1} MB\n",
+        "✅ {}-Worker 流水线初始化就绪！耗时: {:.2}s | 初始物理内存: {:.1} MB\n",
+        num_workers,
         t_init.elapsed().as_secs_f64(),
         get_peak_memory_mb()
     );
@@ -63,34 +80,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_text_boxes = 0;
 
     println!("======================================================================");
-    println!("开始逐页评测 7 份真实工业订单原件图像 (共 47 页)");
+    println!("开始并发评测 7 份真实工业订单原件图像 (共 47 页 / 2-Worker 流水线)");
     println!("======================================================================");
+
+    use rayon::prelude::*;
 
     for (idx, (filename, expected_pages)) in target_pdfs.iter().enumerate() {
         let stem = filename.trim_end_matches(".pdf").trim_end_matches(".PDF");
         println!("\n📂 [{}/7] 正在处理文档: {} (共 {} 页)", idx + 1, filename, expected_pages);
 
         let doc_start = Instant::now();
+        let page_indices: Vec<usize> = (1..=*expected_pages).collect();
+
+        // 使用 Rayon 流水线并发执行页面 OCR 与版面识别 (保序收集)
+        let parsed_pages: Vec<Result<(usize, anyocr::ParsedDocument, f64), anyocr::AnyOcrError>> = pool.install(|| {
+            page_indices
+                .into_par_iter()
+                .map(|p| {
+                    let img_path = cache_img_dir.join(format!("{}_p{}.png", stem, p));
+                    if !img_path.exists() {
+                        return Err(anyocr::AnyOcrError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("未找到页面图像: {}", img_path.display()),
+                        )));
+                    }
+                    let p_img = image::open(&img_path)
+                        .map_err(|e| anyocr::AnyOcrError::Other(e.to_string()))?;
+                    let worker_id = rayon::current_thread_index().unwrap_or(0) % num_workers;
+                    let worker_engine = &engines[worker_id];
+
+                    let p_start = Instant::now();
+                    let parsed = worker_engine.parse_image(&p_img)?;
+                    let p_elapsed = p_start.elapsed().as_secs_f64();
+                    Ok((p, parsed, p_elapsed))
+                })
+                .collect()
+        });
+
         let mut doc_markdown_pages = vec![format!("# {}\n\n*生成引擎: AnyOCR 原生 Rust 双轨版面识别 (PicoDet-S + PP-OCRv6 + SLANet+)*\n", stem)];
         let mut doc_tables = 0;
         let mut doc_cells = 0;
         let mut doc_boxes = 0;
 
-        for p in 1..=*expected_pages {
-            let img_path = cache_img_dir.join(format!("{}_p{}.png", stem, p));
-            if !img_path.exists() {
-                println!("  ⚠️ 未找到页面图像: {}", img_path.display());
-                continue;
-            }
-
-            let p_img = image::open(&img_path)?;
-            let p_start = Instant::now();
-            let parsed = engine.parse_image(&p_img)?;
-            let p_elapsed = p_start.elapsed().as_secs_f64();
-
+        for res in parsed_pages {
+            let (p, parsed, p_elapsed) = res?;
             let mut page_tables = 0;
             let mut page_cells = 0;
             let mut page_boxes = 0;
+
             for page in &parsed.pages {
                 page_boxes += page.boxes.len();
                 for block in &page.blocks {

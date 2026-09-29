@@ -123,7 +123,7 @@ impl LayoutDetector {
 
         Ok(Self {
             session: Mutex::new(session),
-            score_thresh: 0.48,
+            score_thresh: 0.40,
             target_size: (480, 480),
         })
     }

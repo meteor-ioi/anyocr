@@ -206,20 +206,44 @@ impl TextRecognizer {
         // 寻找当前 batch 内的最大宽度作为齐平宽度 (经排序后当前 batch 宽高比极度紧凑)
         let max_w = chunk.iter().map(|item| item.3).max().unwrap_or(16).max(16) as usize;
         let mut tensor = ndarray::Array4::<f32>::from_elem((b, 3, 48, max_w), -1.0);
+        let b_stride = 3 * 48 * max_w;
+        let c_stride = 48 * max_w;
 
-        for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
-            let tw = *target_w as usize;
-            let rgb_crop = crop.to_rgb8();
-            let resized = image::imageops::resize(&rgb_crop, *target_w, 48, image::imageops::FilterType::Triangle);
-            let raw_bytes = resized.as_raw();
-            let stride = tw * 3;
+        if let Some(slice) = tensor.as_slice_mut() {
+            for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
+                let tw = *target_w as usize;
+                let rgb_crop = crop.to_rgb8();
+                let resized = image::imageops::resize(&rgb_crop, *target_w, 48, image::imageops::FilterType::Triangle);
+                let raw_bytes = resized.as_raw();
+                let row_stride = tw * 3;
+                let b_offset = i * b_stride;
 
-            for y in 0..48 {
-                let src_row = &raw_bytes[y * stride..(y + 1) * stride];
-                for (x, p) in src_row.chunks_exact(3).enumerate() {
-                    tensor[[i, 0, y, x]] = p[0] as f32 / 127.5 - 1.0;
-                    tensor[[i, 1, y, x]] = p[1] as f32 / 127.5 - 1.0;
-                    tensor[[i, 2, y, x]] = p[2] as f32 / 127.5 - 1.0;
+                for y in 0..48 {
+                    let src_row = &raw_bytes[y * row_stride..(y + 1) * row_stride];
+                    let y_offset = y * max_w;
+                    for (x, p) in src_row.chunks_exact(3).enumerate() {
+                        let idx = y_offset + x;
+                        slice[b_offset + idx] = p[0] as f32 / 127.5 - 1.0;
+                        slice[b_offset + c_stride + idx] = p[1] as f32 / 127.5 - 1.0;
+                        slice[b_offset + 2 * c_stride + idx] = p[2] as f32 / 127.5 - 1.0;
+                    }
+                }
+            }
+        } else {
+            for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
+                let tw = *target_w as usize;
+                let rgb_crop = crop.to_rgb8();
+                let resized = image::imageops::resize(&rgb_crop, *target_w, 48, image::imageops::FilterType::Triangle);
+                let raw_bytes = resized.as_raw();
+                let stride = tw * 3;
+
+                for y in 0..48 {
+                    let src_row = &raw_bytes[y * stride..(y + 1) * stride];
+                    for (x, p) in src_row.chunks_exact(3).enumerate() {
+                        tensor[[i, 0, y, x]] = p[0] as f32 / 127.5 - 1.0;
+                        tensor[[i, 1, y, x]] = p[1] as f32 / 127.5 - 1.0;
+                        tensor[[i, 2, y, x]] = p[2] as f32 / 127.5 - 1.0;
+                    }
                 }
             }
         }
