@@ -23,6 +23,99 @@ use std::collections::HashSet;
 pub struct LayoutEngine;
 
 impl LayoutEngine {
+    /// 基于版面检测 (PicoDet-S) 与局部表格 ROI 执行高保真双轨版面还原
+    pub fn process_dual_track(
+        items: &[TextBoxItem],
+        page_dims: (u32, u32),
+        _layout_boxes: &[crate::models::LayoutBox],
+        #[cfg(feature = "table")]
+        roi_tables: &[(crate::models::LayoutBox, TableStructureResult)],
+    ) -> (Vec<DocBlock>, String) {
+        if items.is_empty() {
+            return (Vec::new(), String::new());
+        }
+
+        let sorted_items = ReadingOrder::sort_reading_order(items, page_dims.0);
+        let median_h = HeadingClassifier::compute_body_median_height(items);
+
+        #[cfg(feature = "table")]
+        if !roi_tables.is_empty() {
+            // 1. 构建每个局部表格 Block
+            let mut used_item_indices = HashSet::new();
+            let mut table_blocks_with_y: Vec<(f32, DocBlock)> = Vec::new();
+
+            for (lb, t_res) in roi_tables {
+                let mut in_table_items = Vec::new();
+                for (idx, item) in sorted_items.iter().enumerate() {
+                    let cx = (item.coords[0] + item.coords[2]) / 2.0;
+                    let cy = (item.coords[1] + item.coords[3]) / 2.0;
+
+                    // 若中心点落在 Table ROI 内部 (略微外扩 5 像素缓冲)
+                    if cx >= lb.x1 - 5.0 && cx <= lb.x2 + 5.0 && cy >= lb.y1 - 5.0 && cy <= lb.y2 + 5.0 {
+                        in_table_items.push(item.clone());
+                        used_item_indices.insert(idx);
+                    }
+                }
+
+                if let Some(t_block) = TableMatcher::build_table_from_roi(t_res, &in_table_items, lb.to_array()) {
+                    table_blocks_with_y.push((lb.y1, t_block));
+                }
+            }
+
+            // 2. 将非表格文本行与各个 Table Block 按照 Y 轴阅读顺序流式交织组装
+            table_blocks_with_y.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut final_blocks: Vec<DocBlock> = Vec::new();
+            let mut current_text_batch: Vec<TextBoxItem> = Vec::new();
+            let mut table_iter = table_blocks_with_y.into_iter().peekable();
+
+            for (idx, item) in sorted_items.iter().enumerate() {
+                if used_item_indices.contains(&idx) {
+                    continue;
+                }
+
+                let item_y = item.coords[1];
+
+                // 检查是否有表格的起始 Y 位于当前文本行之前
+                while let Some((tbl_y, _)) = table_iter.peek() {
+                    if *tbl_y <= item_y {
+                        if !current_text_batch.is_empty() {
+                            Self::process_text_region(&current_text_batch, median_h, &mut final_blocks);
+                            current_text_batch.clear();
+                        }
+                        let (_, tbl_block) = table_iter.next().unwrap();
+                        final_blocks.push(tbl_block);
+                    } else {
+                        break;
+                    }
+                }
+
+                current_text_batch.push(item.clone());
+            }
+
+            // 结算剩余文本与剩余表格
+            if !current_text_batch.is_empty() {
+                Self::process_text_region(&current_text_batch, median_h, &mut final_blocks);
+            }
+            while let Some((_, tbl_block)) = table_iter.next() {
+                final_blocks.push(tbl_block);
+            }
+
+            let markdown = MarkdownSerializer::serialize(&final_blocks);
+            return (final_blocks, markdown);
+        }
+
+        // 降级回单轨/常规流程
+        #[cfg(feature = "table")]
+        {
+            Self::process(items, page_dims, None)
+        }
+        #[cfg(not(feature = "table"))]
+        {
+            Self::process(items, page_dims)
+        }
+    }
+
     /// 执行端到端版面还原：
     /// 阅读顺序拓扑排序 ➔ 智能表格划分(SLANet/Grid融合) ➔ 标题定级 ➔ 段落/键值对规整 ➔ 组装 AST 与标准 Markdown
     pub fn process(

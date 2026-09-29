@@ -230,3 +230,27 @@
   - [x] 14 项单元测试 100% 通过（新增 `test_grid_table_extraction`）
   - [x] SensiDoc 实机端到端全链路回归通过
 
+---
+
+### Milestone 9：PicoDet 版面检测原生集成与局部表格双轨流重构 (Dual-Track Layout Architecture)
+
+- [x] **9.1 获取并验证 `PicoDet-S_layout_17cls.onnx` 权重**
+  - [x] 导出/部署 `picodet_s_layout.onnx`（4.7MB）至 `models/ocr/`
+  - [x] 探针验证 ONNX 模型输入、输出维度与多类别标签索引
+- [x] **9.2 纯 Rust 原生 `LayoutDetector` 开发 (`src/models/layout_detector.rs`)**
+  - [x] 实现 480x480 CatmullRom 细线保护插值与归一化
+  - [x] 解析 ONNX 内置 multiclass_nms 输出与多类别解码
+  - [x] 坐标还原回原图物理绝对空间
+- [x] **9.3 `engine.rs` 调度流双轨解耦**
+  - [x] 前置调用 `layout_detector` 提取版面 ROI
+  - [x] 将 SLANet 范围严格限制在 `table` ROI 内部（局部裁剪 ➔ 预测 ➔ 坐标映射回原图）
+  - [x] 无表格页面直接 0 开销跳过 SLANet
+- [x] **9.4 版面与 Markdown 流水线集成与代码瘦身**
+  - [x] 消除脆弱的整图全局表格假设与过度堆砌的修补规则
+  - [x] 实现精确空间中心点投影与单元格文本填充 (`process_dual_track`)
+- [x] **9.5 47 页工业 PDF 基准测试与性能/精度评测**
+  - [x] 批量跑通 7 份真实工业订单 PDF (47 页原图，耗时 176s，检出表格 65 张，提取文本框 3,559 个)
+  - [x] 统计纯 Rust 推理耗时、RSS 内存占用与物理单元格提取数
+  - [x] 输出完整对比评测报告与 Markdown 结果归档至 `md_anyocr_rust/`
+
+

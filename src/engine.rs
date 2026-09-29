@@ -1,7 +1,7 @@
 use crate::asset::ModelPaths;
 use crate::error::AnyOcrError;
 use crate::ingestion::image::ImagePreprocessor;
-use crate::models::{TextDetector, TextRecognizer};
+use crate::models::{LayoutDetector, TextDetector, TextRecognizer};
 #[cfg(feature = "table")]
 use crate::models::TableStructurePredictor;
 use crate::types::{
@@ -16,6 +16,7 @@ pub struct Engine {
     config: EngineConfig,
     detector: Arc<TextDetector>,
     recognizer: Arc<TextRecognizer>,
+    layout_detector: Option<Arc<LayoutDetector>>,
     #[cfg(feature = "table")]
     #[allow(dead_code)]
     table_predictor: Option<Arc<TableStructurePredictor>>,
@@ -37,6 +38,19 @@ impl Engine {
             config.max_batch_size,
         )?);
 
+        let layout_detector = if let Some(ref l_path) = paths.layout_path {
+            tracing::info!("正在加载版面区域分析模型: {}", l_path.display());
+            match LayoutDetector::from_file(l_path, config.provider) {
+                Ok(ld) => Some(Arc::new(ld)),
+                Err(e) => {
+                    tracing::warn!("加载版面分析模型失败，降级为规则排版: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         #[cfg(feature = "table")]
         let table_predictor = if config.enable_table {
             if let Some(ref t_path) = paths.table_path {
@@ -53,6 +67,7 @@ impl Engine {
             config,
             detector,
             recognizer,
+            layout_detector,
             #[cfg(feature = "table")]
             table_predictor,
         })
@@ -97,33 +112,53 @@ impl Engine {
         let mut boxes = self.recognizer.recognize_batch(&crops);
         let rec_ms = t_rec.elapsed().as_millis();
 
-        // 3. 表格结构预测 (若开启 table feature 且引擎配置启用)
+        // 3. 原生版面语义探测 (PicoDet-S Layout)
+        let t_layout_det = Instant::now();
+        let layout_boxes = if let Some(ref ld) = self.layout_detector {
+            ld.detect(&working_img).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let _layout_det_ms = t_layout_det.elapsed().as_millis();
+
+        // 4. 表格局部 ROI 预测 (仅对 PicoDet 判定的 table 区域裁剪后送入 SLANet)
         #[cfg(feature = "table")]
         let t_table = Instant::now();
         #[cfg(feature = "table")]
-        let table_res = if self.config.enable_table {
-            self.table_predictor.as_ref().and_then(|p| {
-                match p.predict(&working_img) {
-                    Ok(res) => Some(res),
-                    Err(e) => {
-                        tracing::warn!("表格结构预测失败，将降级为常规文本排版: {e}");
-                        None
+        let table_res_list = if self.config.enable_table && self.table_predictor.is_some() {
+            let predictor = self.table_predictor.as_ref().unwrap();
+            let mut list = Vec::new();
+            for lb in &layout_boxes {
+                if lb.is_table() {
+                    let roi = [lb.x1, lb.y1, lb.x2, lb.y2];
+                    let crop = ImagePreprocessor::crop_box(&working_img, &roi);
+                    if let Ok(mut t_res) = predictor.predict(&crop) {
+                        // 单元格平移回 working_img 坐标系
+                        for cell in &mut t_res.cell_boxes {
+                            cell.x1 += lb.x1;
+                            cell.y1 += lb.y1;
+                            cell.x2 += lb.x1;
+                            cell.y2 += lb.y1;
+                        }
+                        list.push((lb.clone(), t_res));
                     }
                 }
-            })
+            }
+            list
         } else {
-            None
+            Vec::new()
         };
         #[cfg(feature = "table")]
         let table_ms = t_table.elapsed().as_millis();
 
-        // 4. 端到端 AST 语义语法树与版面还原 (阅读顺序重排、标题定级、表格反填、段落合并)
+        // 5. 端到端 AST 语义语法树与双轨版面还原 (阅读顺序重排、标题定级、表格反填、段落合并)
         let t_layout = Instant::now();
-        let (mut blocks, markdown) = crate::layout::LayoutEngine::process(
+        let (mut blocks, markdown) = crate::layout::LayoutEngine::process_dual_track(
             &boxes,
             (work_w, work_h),
+            &layout_boxes,
             #[cfg(feature = "table")]
-            table_res.as_ref(),
+            &table_res_list,
         );
         let layout_ms = t_layout.elapsed().as_millis();
 

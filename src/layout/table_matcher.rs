@@ -58,6 +58,59 @@ impl TableMatcher {
     }
 
     #[cfg(feature = "table")]
+    /// 针对已由版面模型确定的局部表格 ROI 及其对应的 SLANet 预测结果，生成高保真 DocBlock::Table
+    pub fn build_table_from_roi(
+        table_res: &TableStructureResult,
+        in_table_texts: &[TextBoxItem],
+        roi_bbox: [f32; 4],
+    ) -> Option<DocBlock> {
+        if table_res.cell_boxes.is_empty() || table_res.html_tokens.is_empty() {
+            return None;
+        }
+
+        // 空间反填：计算每个文本中心点落在哪个 CellBox 内
+        let mut cell_texts: HashMap<usize, Vec<String>> = HashMap::new();
+        for item in in_table_texts {
+            let cx = (item.coords[0] + item.coords[2]) / 2.0;
+            let cy = (item.coords[1] + item.coords[3]) / 2.0;
+
+            let mut best_cell: Option<usize> = None;
+            let mut min_dist = f32::INFINITY;
+
+            for cell in &table_res.cell_boxes {
+                if cx >= cell.x1 && cx <= cell.x2 && cy >= cell.y1 && cy <= cell.y2 {
+                    best_cell = Some(cell.cell_idx);
+                    break;
+                }
+                let ccx = (cell.x1 + cell.x2) / 2.0;
+                let ccy = (cell.y1 + cell.y2) / 2.0;
+                let dist = (cx - ccx).hypot(cy - ccy);
+                if dist < min_dist {
+                    min_dist = dist;
+                    best_cell = Some(cell.cell_idx);
+                }
+            }
+
+            if let Some(idx) = best_cell {
+                cell_texts.entry(idx).or_default().push(item.text.trim().to_string());
+            }
+        }
+
+        let mut aggregated_cells: HashMap<usize, String> = HashMap::new();
+        for (idx, list) in cell_texts {
+            aggregated_cells.insert(idx, list.join(" "));
+        }
+
+        let (gfm, raw_html) = Self::render_tokens_to_markdown(&table_res.html_tokens, &aggregated_cells);
+
+        Some(DocBlock::Table {
+            markdown_table: gfm,
+            raw_html: Some(raw_html),
+            bbox: roi_bbox,
+        })
+    }
+
+    #[cfg(feature = "table")]
     /// 将 OCR 文本与 SLANet 表格预测结果进行空间对齐与多块划分
     pub fn match_and_build(
         table_res: &TableStructureResult,

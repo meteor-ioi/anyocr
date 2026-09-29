@@ -8,6 +8,7 @@ pub const REC_MOBILE_FILENAME: &str = "PP-OCRv6_rec_small.onnx";
 pub const REC_SERVER_FILENAME: &str = "PP-OCRv6_rec_server.onnx";
 pub const DICT_FILENAME: &str = "ppocrv6_dict.txt";
 pub const TABLE_FILENAME: &str = "slanet-plus.onnx";
+pub const LAYOUT_FILENAME: &str = "picodet_s_layout_17cls.onnx";
 
 /// 获取本地模型缓存主目录 (优先 ANYOCR_CACHE_DIR，其次 ~/.cache/anyocr/models/)
 pub fn get_default_cache_dir() -> PathBuf {
@@ -29,6 +30,7 @@ pub struct ModelPaths {
     pub rec_path: PathBuf,
     pub dict_path: PathBuf,
     pub table_path: Option<PathBuf>,
+    pub layout_path: Option<PathBuf>,
 }
 
 impl ModelPaths {
@@ -47,11 +49,22 @@ impl ModelPaths {
                         .map(|p| p.join(DICT_FILENAME))
                         .unwrap_or_else(|| PathBuf::from(DICT_FILENAME))
                 });
+                let layout = det_path
+                    .parent()
+                    .map(|p| p.join(LAYOUT_FILENAME))
+                    .filter(|p| p.exists())
+                    .or_else(|| {
+                        det_path
+                            .parent()
+                            .map(|p| p.join("picodet_s_layout.onnx"))
+                            .filter(|p| p.exists())
+                    });
                 Ok(Self {
                     det_path: det_path.clone(),
                     rec_path: rec_path.clone(),
                     dict_path: dict,
                     table_path: table_path.clone(),
+                    layout_path: layout,
                 })
             }
             ModelProfile::Standard | ModelProfile::Fast | ModelProfile::Accurate => {
@@ -80,6 +93,7 @@ impl ModelPaths {
                     }
                     let dict = dir.join(DICT_FILENAME);
                     let table = dir.join(TABLE_FILENAME);
+                    let layout = dir.join(LAYOUT_FILENAME);
 
                     if det.exists() && rec.exists() && dict.exists() {
                         return Ok(Self {
@@ -87,6 +101,13 @@ impl ModelPaths {
                             rec_path: rec,
                             dict_path: dict,
                             table_path: if table.exists() { Some(table) } else { None },
+                            layout_path: if layout.exists() {
+                                Some(layout)
+                            } else if dir.join("picodet_s_layout.onnx").exists() {
+                                Some(dir.join("picodet_s_layout.onnx"))
+                            } else {
+                                None
+                            },
                         });
                     }
                 }
