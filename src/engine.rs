@@ -100,19 +100,9 @@ impl Engine {
         let t_det = Instant::now();
         let det_boxes = self.detector.detect(&working_img)?;
         let det_ms = t_det.elapsed().as_millis();
+        let det_boxes_count = det_boxes.len();
 
-        // 2. 文本行切片裁剪与字符识别 (PP-OCRv6 SVTR)
-        let t_rec = Instant::now();
-        let mut crops = Vec::with_capacity(det_boxes.len());
-        for b in &det_boxes {
-            let coords = b.to_array();
-            let crop = ImagePreprocessor::crop_box(&working_img, &coords);
-            crops.push((crop, coords));
-        }
-        let mut boxes = self.recognizer.recognize_batch(&crops);
-        let rec_ms = t_rec.elapsed().as_millis();
-
-        // 3. 原生版面语义探测 (PicoDet-S Layout)
+        // 2. 原生版面语义探测 (PicoDet-S Layout)
         let t_layout_det = Instant::now();
         let layout_boxes = if let Some(ref ld) = self.layout_detector {
             ld.detect(&working_img).unwrap_or_default()
@@ -121,28 +111,54 @@ impl Engine {
         };
         let _layout_det_ms = t_layout_det.elapsed().as_millis();
 
-        // 4. 表格局部 ROI 预测 (仅对 PicoDet 判定的 table 区域裁剪后送入 SLANet)
+        // 3. 提取所有切片 (文本切片 + 表格切片)，提取完成后立即显式释放 working_img 大图
+        let mut crops = Vec::with_capacity(det_boxes_count);
+        for b in &det_boxes {
+            let coords = b.to_array();
+            let crop = ImagePreprocessor::crop_box(&working_img, &coords);
+            crops.push((crop, coords));
+        }
+
         #[cfg(feature = "table")]
-        let t_table = Instant::now();
+        let mut table_crops = Vec::new();
         #[cfg(feature = "table")]
-        let table_res_list = if self.config.enable_table && self.table_predictor.is_some() {
-            let predictor = self.table_predictor.as_ref().unwrap();
-            let mut list = Vec::new();
+        if self.config.enable_table && self.table_predictor.is_some() {
             for lb in &layout_boxes {
                 if lb.is_table() {
                     let roi = [lb.x1, lb.y1, lb.x2, lb.y2];
                     let crop = ImagePreprocessor::crop_box(&working_img, &roi);
-                    if let Ok(mut t_res) = predictor.predict(&crop) {
-                        // 单元格平移回 working_img 坐标系
-                        for cell in &mut t_res.cell_boxes {
-                            cell.x1 += lb.x1;
-                            cell.y1 += lb.y1;
-                            cell.x2 += lb.x1;
-                            cell.y2 += lb.y1;
-                        }
-                        list.push((lb.clone(), t_res));
-                    }
+                    table_crops.push((lb.clone(), crop));
                 }
+            }
+        }
+
+        // 💡 显式提前释放超大位图工作缓冲与检测框 (彻底阻断大图与后续批处理识别/表格推理的内存叠加)
+        drop(working_img);
+        drop(det_boxes);
+
+        // 4. 文本行切片批处理字符识别 (PP-OCRv6 SVTR，带 Arena 内存复用与流式逐批 Drop)
+        let t_rec = Instant::now();
+        let mut boxes = self.recognizer.recognize_batch(crops);
+        let rec_ms = t_rec.elapsed().as_millis();
+
+        // 5. 表格局部 ROI 预测 (SLANet)
+        #[cfg(feature = "table")]
+        let t_table = Instant::now();
+        #[cfg(feature = "table")]
+        let table_res_list = if !table_crops.is_empty() {
+            let predictor = self.table_predictor.as_ref().unwrap();
+            let mut list = Vec::with_capacity(table_crops.len());
+            for (lb, crop) in table_crops {
+                if let Ok(mut t_res) = predictor.predict(&crop) {
+                    for cell in &mut t_res.cell_boxes {
+                        cell.x1 += lb.x1;
+                        cell.y1 += lb.y1;
+                        cell.x2 += lb.x1;
+                        cell.y2 += lb.y1;
+                    }
+                    list.push((lb, t_res));
+                }
+                drop(crop); // 显式立即释放表格切片
             }
             list
         } else {
@@ -151,7 +167,7 @@ impl Engine {
         #[cfg(feature = "table")]
         let table_ms = t_table.elapsed().as_millis();
 
-        // 5. 端到端 AST 语义语法树与双轨版面还原 (阅读顺序重排、标题定级、表格反填、段落合并)
+        // 6. 端到端 AST 语义语法树与双轨版面还原 (阅读顺序重排、标题定级、表格反填、段落合并)
         let t_layout = Instant::now();
         let (mut blocks, markdown) = crate::layout::LayoutEngine::process_dual_track(
             &boxes,
@@ -162,7 +178,7 @@ impl Engine {
         );
         let layout_ms = t_layout.elapsed().as_millis();
 
-        // 5. 空间几何坐标逆变换：将 working_img 坐标还原回原图物理像素 (orig_w, orig_h)
+        // 7. 空间几何坐标逆变换：将 working_img 坐标还原回原图物理像素 (orig_w, orig_h)
         if (scale_factor - 1.0).abs() > 1e-4 && scale_factor > 0.0 {
             for b in &mut boxes {
                 b.coords[0] /= scale_factor;
@@ -187,12 +203,12 @@ impl Engine {
         #[cfg(feature = "table")]
         eprintln!(
             "[anyocr 阶段耗时] 原图: {}x{} (推理视窗: {}x{}) | 检测: {}ms ({}行) | 识别: {}ms | 表格: {}ms | 排版: {}ms | 端到端: {}ms",
-            orig_w, orig_h, work_w, work_h, det_ms, det_boxes.len(), rec_ms, table_ms, layout_ms, elapsed_ms
+            orig_w, orig_h, work_w, work_h, det_ms, det_boxes_count, rec_ms, table_ms, layout_ms, elapsed_ms
         );
         #[cfg(not(feature = "table"))]
         eprintln!(
             "[anyocr 阶段耗时] 原图: {}x{} (推理视窗: {}x{}) | 检测: {}ms ({}行) | 识别: {}ms | 排版: {}ms | 端到端: {}ms",
-            orig_w, orig_h, work_w, work_h, det_ms, det_boxes.len(), rec_ms, layout_ms, elapsed_ms
+            orig_w, orig_h, work_w, work_h, det_ms, det_boxes_count, rec_ms, layout_ms, elapsed_ms
         );
 
         Ok(ParsedDocument {

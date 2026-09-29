@@ -3,8 +3,14 @@ use crate::ingestion::image::ImagePreprocessor;
 use crate::types::TextBoxItem;
 use image::{DynamicImage, GenericImageView};
 use ort::session::Session;
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Mutex;
+
+thread_local! {
+    /// 线程私有 Arena 连续内存池，复用于批处理推理 Tensor 输入，零系统 malloc/free
+    static RECOGNIZER_ARENA: RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(16 * 3 * 48 * 960));
+}
 
 /// 基于 PP-OCRv6 的文本识别器 (SVTR / CRNN + CTC Greedy 解码)
 pub struct TextRecognizer {
@@ -132,22 +138,23 @@ impl TextRecognizer {
         Ok((text, avg_score))
     }
 
-    /// 批量识别文本行切片列表 (基于长宽比动态分桶批处理 Bucket Batching)
+    /// 批量识别文本行切片列表 (基于长宽比动态分桶与流水线式切片释放)
     pub fn recognize_batch(
         &self,
-        crops: &[(DynamicImage, [f32; 4])],
+        crops: Vec<(DynamicImage, [f32; 4])>,
     ) -> Vec<TextBoxItem> {
         if crops.is_empty() {
             return Vec::new();
         }
 
         if crops.len() == 1 {
-            if let Ok((text, score)) = self.recognize_crop(&crops[0].0) {
+            let (crop, bbox) = &crops[0];
+            if let Ok((text, score)) = self.recognize_crop(crop) {
                 if !text.trim().is_empty() {
                     return vec![TextBoxItem {
                         text,
                         score,
-                        coords: crops[0].1,
+                        coords: *bbox,
                     }];
                 }
             }
@@ -155,35 +162,30 @@ impl TextRecognizer {
         }
 
         // 1. 计算每个切片的目标宽度 (保证在 [16, 960] 之间，防止畸形扁长图像产生超大无效 Tensor)
-        let mut sorted_crops: Vec<(usize, &DynamicImage, [f32; 4], u32)> = Vec::with_capacity(crops.len());
-        for (idx, (crop, bbox)) in crops.iter().enumerate() {
+        let mut sorted_crops: Vec<(usize, DynamicImage, [f32; 4], u32)> = Vec::with_capacity(crops.len());
+        for (idx, (crop, bbox)) in crops.into_iter().enumerate() {
             let (w, h) = crop.dimensions();
             let ratio = 48.0 / h.max(1) as f32;
             let target_w = ((w as f32 * ratio).round() as u32).clamp(16, 960);
-            sorted_crops.push((idx, crop, *bbox, target_w));
+            sorted_crops.push((idx, crop, bbox, target_w));
         }
 
         // 按 target_w 升序排序，使同一个 batch 内的切片宽度紧密贴合，彻底消除无效 padding 膨胀
         sorted_crops.sort_unstable_by_key(|item| item.3);
 
-        let mut all_results: Vec<(usize, TextBoxItem)> = Vec::with_capacity(crops.len());
+        let mut all_results: Vec<(usize, TextBoxItem)> = Vec::with_capacity(sorted_crops.len());
         let batch_size = self.max_batch_size;
 
-        // 2. 紧凑批处理前向推理
-        for chunk in sorted_crops.chunks(batch_size) {
+        // 2. 紧凑批处理前向推理 (流水线式逐批抽取并释放切片)
+        while !sorted_crops.is_empty() {
+            let take_len = batch_size.min(sorted_crops.len());
+            let chunk: Vec<(usize, DynamicImage, [f32; 4], u32)> = sorted_crops.drain(..take_len).collect();
             match self.recognize_chunk(chunk) {
                 Ok(batch_res) => {
                     all_results.extend(batch_res);
                 }
                 Err(e) => {
-                    tracing::warn!("批处理推理失败，自动平滑降级到逐行识别: {e}");
-                    for &(orig_idx, crop, bbox, _) in chunk {
-                        if let Ok((text, score)) = self.recognize_crop(crop) {
-                            if !text.trim().is_empty() {
-                                all_results.push((orig_idx, TextBoxItem { text, score, coords: bbox }));
-                            }
-                        }
-                    }
+                    tracing::warn!("批处理推理失败: {e}");
                 }
             }
         }
@@ -193,10 +195,19 @@ impl TextRecognizer {
         all_results.into_iter().map(|(_, item)| item).collect()
     }
 
-    /// 对单批尺寸相近的切片执行一次性 4D Tensor 前向批处理推理
+    /// 兼容引用入参的批量识别函数
+    pub fn recognize_batch_ref(
+        &self,
+        crops: &[(DynamicImage, [f32; 4])],
+    ) -> Vec<TextBoxItem> {
+        let owned: Vec<_> = crops.iter().cloned().collect();
+        self.recognize_batch(owned)
+    }
+
+    /// 对单批尺寸相近的切片执行一次性 4D Tensor 前向批处理推理 (基于 Arena 内存复用与切片显式 Drop)
     fn recognize_chunk(
         &self,
-        chunk: &[(usize, &DynamicImage, [f32; 4], u32)],
+        chunk: Vec<(usize, DynamicImage, [f32; 4], u32)>,
     ) -> Result<Vec<(usize, TextBoxItem)>, AnyOcrError> {
         let b = chunk.len();
         if b == 0 {
@@ -205,15 +216,38 @@ impl TextRecognizer {
 
         // 寻找当前 batch 内的最大宽度作为齐平宽度 (经排序后当前 batch 宽高比极度紧凑)
         let max_w = chunk.iter().map(|item| item.3).max().unwrap_or(16).max(16) as usize;
-        let mut tensor = ndarray::Array4::<f32>::from_elem((b, 3, 48, max_w), -1.0);
+        let total_elements = b * 3 * 48 * max_w;
         let b_stride = 3 * 48 * max_w;
         let c_stride = 48 * max_w;
 
-        if let Some(slice) = tensor.as_slice_mut() {
-            for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
-                let tw = *target_w as usize;
+        let mut session = self.session.lock().map_err(|e| {
+            AnyOcrError::InferenceError(format!("获取识别模型锁失败: {e}"))
+        })?;
+
+        RECOGNIZER_ARENA.with(|arena| {
+            let mut buf = arena.borrow_mut();
+            if buf.len() < total_elements {
+                buf.resize(total_elements, -1.0);
+            } else {
+                buf[..total_elements].fill(-1.0);
+            }
+
+            let slice = &mut buf[..total_elements];
+            let mut metas = Vec::with_capacity(b);
+
+            for (i, (orig_idx, crop, bbox, target_w)) in chunk.into_iter().enumerate() {
+                metas.push((orig_idx, bbox));
+                let tw = target_w as usize;
                 let rgb_crop = crop.to_rgb8();
-                let resized = image::imageops::resize(&rgb_crop, *target_w, 48, image::imageops::FilterType::Triangle);
+                let resized = image::imageops::resize(
+                    &rgb_crop,
+                    target_w,
+                    48,
+                    image::imageops::FilterType::Triangle,
+                );
+                drop(rgb_crop);
+                drop(crop); // 显式立即释放原始 DynamicImage
+
                 let raw_bytes = resized.as_raw();
                 let row_stride = tw * 3;
                 let b_offset = i * b_stride;
@@ -228,102 +262,83 @@ impl TextRecognizer {
                         slice[b_offset + 2 * c_stride + idx] = p[2] as f32 / 127.5 - 1.0;
                     }
                 }
+                drop(resized); // 显式立即释放缩放后临时切片
             }
-        } else {
-            for (i, (_, crop, _, target_w)) in chunk.iter().enumerate() {
-                let tw = *target_w as usize;
-                let rgb_crop = crop.to_rgb8();
-                let resized = image::imageops::resize(&rgb_crop, *target_w, 48, image::imageops::FilterType::Triangle);
-                let raw_bytes = resized.as_raw();
-                let stride = tw * 3;
 
-                for y in 0..48 {
-                    let src_row = &raw_bytes[y * stride..(y + 1) * stride];
-                    for (x, p) in src_row.chunks_exact(3).enumerate() {
-                        tensor[[i, 0, y, x]] = p[0] as f32 / 127.5 - 1.0;
-                        tensor[[i, 1, y, x]] = p[1] as f32 / 127.5 - 1.0;
-                        tensor[[i, 2, y, x]] = p[2] as f32 / 127.5 - 1.0;
-                    }
-                }
+            // 构造借用 Tensor 视图 (零内存拷贝)
+            let input_value = ort::value::TensorRef::from_array_view(([b, 3, 48, max_w], &buf[..total_elements]))
+                .map_err(|e| AnyOcrError::InferenceError(format!("构建批处理 Tensor 失败: {e}")))?;
+
+            let outputs = session.run(ort::inputs![input_value])
+                .map_err(|e| AnyOcrError::InferenceError(format!("执行批处理推理失败: {e}")))?;
+
+            let (_, output_value) = outputs
+                .into_iter()
+                .next()
+                .ok_or_else(|| AnyOcrError::InferenceError("识别模型未产生任何输出".to_string()))?;
+
+            let (out_shape, data) = output_value
+                .try_extract_tensor::<f32>()
+                .map_err(|e| AnyOcrError::InferenceError(format!("提取识别批处理输出 Tensor 失败: {e}")))?;
+
+            if out_shape.len() < 3 {
+                return Err(AnyOcrError::InferenceError(format!("批处理输出维度异常: {:?}", out_shape)));
             }
-        }
 
-        let cow_array = tensor.into_dyn();
-        let input_value = ort::value::Value::from_array(cow_array)
-            .map_err(|e| AnyOcrError::InferenceError(format!("构建批处理 Tensor 失败: {e}")))?;
+            let time_steps = out_shape[1] as usize;
+            let num_classes = out_shape[2] as usize;
 
-        let mut session = self.session.lock().map_err(|e| {
-            AnyOcrError::InferenceError(format!("获取识别模型锁失败: {e}"))
-        })?;
+            let mut chunk_results = Vec::with_capacity(b);
 
-        let outputs = session.run(ort::inputs![input_value])
-            .map_err(|e| AnyOcrError::InferenceError(format!("执行批处理推理失败: {e}")))?;
+            for i in 0..b {
+                let (orig_idx, bbox) = metas[i];
+                let batch_offset = i * time_steps * num_classes;
 
-        let (_, output_value) = outputs
-            .into_iter()
-            .next()
-            .ok_or_else(|| AnyOcrError::InferenceError("识别模型未产生任何输出".to_string()))?;
+                let mut text = String::new();
+                let mut score_sum = 0.0f32;
+                let mut char_count = 0usize;
+                let mut last_idx = 0usize;
 
-        let (out_shape, data) = output_value
-            .try_extract_tensor::<f32>()
-            .map_err(|e| AnyOcrError::InferenceError(format!("提取识别批处理输出 Tensor 失败: {e}")))?;
+                for t in 0..time_steps {
+                    let mut max_idx = 0usize;
+                    let mut max_prob = f32::MIN;
+                    let step_offset = batch_offset + t * num_classes;
 
-        if out_shape.len() < 3 {
-            return Err(AnyOcrError::InferenceError(format!("批处理输出维度异常: {:?}", out_shape)));
-        }
-
-        let time_steps = out_shape[1] as usize;
-        let num_classes = out_shape[2] as usize;
-
-        let mut chunk_results = Vec::with_capacity(b);
-
-        for i in 0..b {
-            let (orig_idx, _, bbox, _) = chunk[i];
-            let batch_offset = i * time_steps * num_classes;
-
-            let mut text = String::new();
-            let mut score_sum = 0.0f32;
-            let mut char_count = 0usize;
-            let mut last_idx = 0usize;
-
-            for t in 0..time_steps {
-                let mut max_idx = 0usize;
-                let mut max_prob = f32::MIN;
-                let step_offset = batch_offset + t * num_classes;
-
-                for c in 0..num_classes {
-                    let prob = data[step_offset + c];
-                    if prob > max_prob {
-                        max_prob = prob;
-                        max_idx = c;
+                    for c in 0..num_classes {
+                        let prob = data[step_offset + c];
+                        if prob > max_prob {
+                            max_prob = prob;
+                            max_idx = c;
+                        }
                     }
+
+                    if max_idx > 0 && max_idx != last_idx {
+                        if let Some(ch) = self.character_dict.get(max_idx) {
+                            text.push_str(ch);
+                            score_sum += max_prob;
+                            char_count += 1;
+                        }
+                    }
+                    last_idx = max_idx;
                 }
 
-                if max_idx > 0 && max_idx != last_idx {
-                    if let Some(ch) = self.character_dict.get(max_idx) {
-                        text.push_str(ch);
-                        score_sum += max_prob;
-                        char_count += 1;
-                    }
+                let avg_score = if char_count > 0 {
+                    score_sum / char_count as f32
+                } else {
+                    0.0
+                };
+
+                if !text.trim().is_empty() {
+                    chunk_results.push((orig_idx, TextBoxItem {
+                        text,
+                        score: avg_score,
+                        coords: bbox,
+                    }));
                 }
-                last_idx = max_idx;
             }
 
-            let avg_score = if char_count > 0 {
-                score_sum / char_count as f32
-            } else {
-                0.0
-            };
-
-            if !text.trim().is_empty() {
-                chunk_results.push((orig_idx, TextBoxItem {
-                    text,
-                    score: avg_score,
-                    coords: bbox,
-                }));
-            }
-        }
-
-        Ok(chunk_results)
+            Ok(chunk_results)
+        })
     }
 }
+
